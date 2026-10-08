@@ -117,7 +117,7 @@ if errorlevel 1 (
     echo ERROR: The staged Tesseract executable could not start.
     exit /b 1
 )
-set "TESSDATA_PREFIX=%CD%\build\win-tesseract"
+set "TESSDATA_PREFIX=%CD%\build\win-tesseract\tessdata"
 "build\win-tesseract\tesseract.exe" --list-langs > "build\win-tesseract\languages.txt" 2>&1
 findstr /I /X "kor" "build\win-tesseract\languages.txt" >nul
 if errorlevel 1 (

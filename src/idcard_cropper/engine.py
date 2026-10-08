@@ -139,11 +139,11 @@ def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
             tessdata_dir = Path(__file__).parent / "tessdata"
             korean_model = tessdata_dir / "kor.traineddata"
         if korean_model.is_file():
-            # Tesseract reads models from TESSDATA_PREFIX/tessdata. Passing an
-            # absolute Windows path through pytesseract's config parser strips
-            # backslashes or retains quotes, so use the environment instead.
+            # Passing an absolute Windows path through pytesseract's config
+            # parser strips backslashes or retains quotes, so use the
+            # TESSDATA_PREFIX environment variable instead.
             import os
-            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir.parent)
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
             try:
                 pytesseract.get_tesseract_version()
             except Exception as exc:
