@@ -1,0 +1,17 @@
+.venv/
+.venv-win/
+__pycache__/
+*.egg-info/
+output/
+build/
+dist/
+*.spec
+
+# Scans may contain personal information; keep local images and documents out of Git.
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.bmp
+*.pdf

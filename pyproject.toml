@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idcard-scan-cropper"
+version = "0.1.0"
+description = "Local ID card scan detection and print-size correction"
+requires-python = ">=3.10"
+dependencies = [
+  "opencv-python>=4.8",
+  "numpy>=1.26",
+  "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]
+pdf = ["PyMuPDF>=1.23"]
+gui = ["PySide6>=6.6"]
+
+[project.scripts]
+idcard-crop = "idcard_cropper.cli:main"
+idcard-crop-gui = "idcard_cropper.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+idcard_cropper = ["data/*.traineddata"]
