@@ -11,6 +11,7 @@ from PIL import Image, ImageOps
 
 
 PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
+CARD_EDGE_INSET_RATIO = 0.015  # Crop just inside rounded physical card corners.
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -119,6 +120,15 @@ def _warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
     matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), destination)
     return cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE)
+
+
+def _crop_inside_card_edges(card: np.ndarray) -> np.ndarray:
+    """Trim a small inner border so rounded card corners cannot enter the print."""
+    h, w = card.shape[:2]
+    inset = max(1, int(round(min(h, w) * CARD_EDGE_INSET_RATIO)))
+    if h <= inset * 2 or w <= inset * 2:
+        raise ValueError("검출된 신분증 영역이 너무 작습니다.")
+    return card[inset:h - inset, inset:w - inset]
 
 
 def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
@@ -252,7 +262,7 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         return CropResult("manual_review", "카드 외곽을 확실하게 검출하지 못했습니다.",
                           diagnostic_path=diagnostic_path, confidence=confidence)
     try:
-        card = _warp(image, corners)
+        card = _crop_inside_card_edges(_warp(image, corners))
     except Exception:
         return CropResult("manual_review", "원근 보정에 실패했습니다.",
                           diagnostic_path=diagnostic_path, confidence=confidence)

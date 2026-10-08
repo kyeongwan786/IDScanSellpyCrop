@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl
-from PySide6.QtGui import QDesktopServices, QImage, QPageLayout, QPainter, QPixmap
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF
+from PySide6.QtGui import QDesktopServices, QImage, QPageLayout, QPageSize, QPainter, QPixmap
+from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -267,12 +267,27 @@ class MainWindow(QMainWindow):
             return
 
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        # Canon SELPHY C Size stock is 86 x 54 mm; default to landscape C media.
+        c_size = QPageSize(QSizeF(86.0, 54.0), QPageSize.Unit.Millimeter, "C Size")
+        printer.setPageSize(c_size)
         printer.setPageOrientation(QPageLayout.Orientation.Landscape)
         printer.setDocName(result.output_path.stem)
         dialog = QPrintDialog(printer, self)
         dialog.setWindowTitle("SELPHY 프린터와 용지 설정")
         if dialog.exec() != QPrintDialog.DialogCode.Accepted:
             return
+
+        # Prefer the printer driver's own C Size form when it exposes one.
+        printer_info = QPrinterInfo(printer.printerName())
+        for supported_size in printer_info.supportedPageSizes():
+            size = supported_size.size(QPageSize.Unit.Millimeter)
+            if abs(max(size.width(), size.height()) - 86.0) <= 0.5 and abs(
+                min(size.width(), size.height()) - 54.0
+            ) <= 0.5:
+                c_size = supported_size
+                break
+        printer.setPageSize(c_size)
+        printer.setPageOrientation(QPageLayout.Orientation.Landscape)
 
         # Print the 81 x 51 mm card at its physical size, centered on the
         # printer's selected paper. Users choose SELPHY/card media in its driver.
