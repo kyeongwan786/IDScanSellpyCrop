@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 
 PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
-CARD_EDGE_INSET_RATIO = 0.015  # Crop just inside rounded physical card corners.
+CARD_EDGE_INSET_RATIO = 0.008  # Keep the printed card edge while trimming corner rounding.
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -228,6 +228,7 @@ def _save_crop_preview(card: np.ndarray, source: Path, destination: Path) -> Pat
     """Save a card-only preview at print dimensions, even if OCR needs review."""
     if card.shape[0] > card.shape[1]:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+    card = _crop_inside_card_edges(card)
     preview = _fit_print_size(card)
     path = destination / f"{source.stem}_crop_preview.jpg"
     rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
@@ -262,7 +263,9 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         return CropResult("manual_review", "카드 외곽을 확실하게 검출하지 못했습니다.",
                           diagnostic_path=diagnostic_path, confidence=confidence)
     try:
-        card = _crop_inside_card_edges(_warp(image, corners))
+        # First rectify the detected card plane. Keep the full card for OCR so
+        # orientation scoring cannot lose the top/edge text to an early crop.
+        card = _warp(image, corners)
     except Exception:
         return CropResult("manual_review", "원근 보정에 실패했습니다.",
                           diagnostic_path=diagnostic_path, confidence=confidence)
@@ -283,6 +286,9 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     # Landscape print dimensions; rotate portrait cards to landscape without altering content.
     if card.shape[0] > card.shape[1]:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+    # Trim rounded physical corners only after the card has been straightened
+    # and turned upright, preserving a little more of its top edge.
+    card = _crop_inside_card_edges(card)
 
     warning = None
     if min(card.shape[:2]) < 602:
