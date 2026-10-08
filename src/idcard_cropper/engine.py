@@ -11,7 +11,6 @@ from PIL import Image, ImageOps
 
 
 PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
-CARD_EDGE_INSET_RATIO = 0.008  # Keep the printed card edge while trimming corner rounding.
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -61,6 +60,59 @@ def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
     return (max(width_delta, height_delta) <= 0.04
             and direction_delta(edges[0], edges[1]) <= 3.0
             and direction_delta(edges[2], edges[3]) <= 3.0)
+
+
+def _move_corners_inside_component(mask: np.ndarray, quad: np.ndarray) -> np.ndarray | None:
+    """Inset all four corners equally until each lies inside the detected card."""
+    tl, tr, br, bl = quad
+
+    def unit(vector: np.ndarray) -> np.ndarray:
+        length = float(np.linalg.norm(vector))
+        return vector / length if length > 0 else vector
+
+    inward_axes = (
+        (unit(tr - tl), unit(bl - tl)),
+        (unit(tl - tr), unit(br - tr)),
+        (unit(tr - br), unit(bl - br)),
+        (unit(br - bl), unit(tl - bl)),
+    )
+    side_lengths = (np.linalg.norm(tr - tl), np.linalg.norm(br - bl),
+                    np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
+    max_inset = max(1, int(round(min(side_lengths) * 0.05)))
+    required: list[int] = []
+    height, width = mask.shape[:2]
+
+    for corner, (axis_a, axis_b) in zip(quad, inward_axes):
+        entry = None
+        for distance in range(max_inset + 1):
+            point = np.rint(corner + distance * (axis_a + axis_b)).astype(int)
+            x, y = int(point[0]), int(point[1])
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            # Require a short continuous run so a stray background speck
+            # cannot make a rounded corner look like part of the card.
+            run = True
+            for extra in (1, 2):
+                sample = np.rint(corner + (distance + extra) * (axis_a + axis_b)).astype(int)
+                sx, sy = int(sample[0]), int(sample[1])
+                if not (0 <= sx < width and 0 <= sy < height and mask[sy, sx]):
+                    run = False
+                    break
+            if mask[y, x] and run:
+                entry = distance
+                break
+        if entry is None:
+            return None
+        required.append(entry)
+
+    # One shared inset keeps all four crop edges parallel. Use the deepest
+    # corner entry so every point is inside the card rather than on scan paper.
+    inset = max(required)
+    adjusted = np.array([
+        corner + inset * (axis_a + axis_b)
+        for corner, (axis_a, axis_b) in zip(quad, inward_axes)
+    ], dtype=np.float32)
+    return adjusted
 
 
 def _background_lab(image: np.ndarray) -> np.ndarray:
@@ -127,6 +179,10 @@ def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
         if quad is None:
             continue
 
+        quad = _move_corners_inside_component(component, quad)
+        if quad is None:
+            continue
+
         qarea = abs(cv2.contourArea(quad.reshape(-1, 1, 2)))
         fill = min(1.0, cv2.contourArea(contour) / max(qarea, 1.0))
         # Prefer a substantial, compact component; weak fits are reviewed manually.
@@ -147,15 +203,6 @@ def _warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
     matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), destination)
     return cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE)
-
-
-def _crop_inside_card_edges(card: np.ndarray) -> np.ndarray:
-    """Trim a small inner border so rounded card corners cannot enter the print."""
-    h, w = card.shape[:2]
-    inset = max(1, int(round(min(h, w) * CARD_EDGE_INSET_RATIO)))
-    if h <= inset * 2 or w <= inset * 2:
-        raise ValueError("검출된 신분증 영역이 너무 작습니다.")
-    return card[inset:h - inset, inset:w - inset]
 
 
 def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
@@ -255,7 +302,6 @@ def _save_crop_preview(card: np.ndarray, source: Path, destination: Path) -> Pat
     """Save a card-only preview at print dimensions, even if OCR needs review."""
     if card.shape[0] > card.shape[1]:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
-    card = _crop_inside_card_edges(card)
     preview = _fit_print_size(card)
     path = destination / f"{source.stem}_crop_preview.jpg"
     rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
@@ -281,8 +327,8 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     if corners is not None:
         cv2.polylines(diagnostic, [corners.astype(np.int32)], True, (0, 200, 0), 3)
         for i, point in enumerate(corners.astype(int)):
-            cv2.circle(diagnostic, tuple(point), 9, (0, 0, 255), -1)
-            cv2.putText(diagnostic, str(i + 1), tuple(point + 12), cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.circle(diagnostic, tuple(point), 5, (0, 0, 255), -1)
+            cv2.putText(diagnostic, str(i + 1), tuple(point + 8), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 0, 255), 2)
     Image.fromarray(cv2.cvtColor(diagnostic, cv2.COLOR_BGR2RGB)).save(diagnostic_path, quality=92)
 
@@ -313,10 +359,6 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     # Landscape print dimensions; rotate portrait cards to landscape without altering content.
     if card.shape[0] > card.shape[1]:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
-    # Trim rounded physical corners only after the card has been straightened
-    # and turned upright, preserving a little more of its top edge.
-    card = _crop_inside_card_edges(card)
-
     warning = None
     if min(card.shape[:2]) < 602:
         warning = "원본 카드 해상도가 낮아 확대 출력 시 선명도가 제한됩니다."
