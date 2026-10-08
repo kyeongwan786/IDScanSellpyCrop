@@ -56,7 +56,11 @@ jobs:
           $batchOutput = @(& cmd.exe /d /c $batchCommand 2>&1)
           $batchExitCode = $LASTEXITCODE
           $batchOutput | ForEach-Object { Write-Host $_ }
-          if ($batchExitCode -ne 0) { exit $batchExitCode }
+          if ($batchExitCode -ne 0) {
+            $batchTail = ($batchOutput | Select-Object -Last 20) -join ' | '
+            Write-Output "::error title=Windows batch failed::Exit $batchExitCode; $batchTail"
+            exit $batchExitCode
+          }
 
       - name: Confirm EXE is present for upload
         shell: pwsh
