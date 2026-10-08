@@ -108,8 +108,7 @@ if errorlevel 1 (
 )
 
 echo [5/6] Building one-file Windows x64 GUI executable...
-set "PYINSTALLER_DIST=dist"
-if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
+set "PYINSTALLER_DIST=%~dp0dist"
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
     --distpath "%PYINSTALLER_DIST%" ^
     --paths src ^
@@ -134,12 +133,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if defined IDCARD_BUILD_ROOT (
-    copy /y "%PYINSTALLER_DIST%\IDCardCropper.exe" "%IDCARD_BUILD_ROOT%\IDCardCropper.exe" >nul
-    if errorlevel 1 (
-        echo ERROR: Could not copy the verified EXE to "%IDCARD_BUILD_ROOT%\IDCardCropper.exe".
-        exit /b 1
-    )
+copy /y "%PYINSTALLER_DIST%\IDCardCropper.exe" "%~dp0IDCardCropper.exe" >nul
+if errorlevel 1 (
+    echo ERROR: Could not copy the verified EXE beside the build script.
+    exit /b 1
 )
 
 echo Build complete: %PYINSTALLER_DIST%\IDCardCropper.exe (Windows x64)
