@@ -58,7 +58,10 @@ jobs:
         shell: pwsh
         run: |
           $exePath = Join-Path $env:GITHUB_WORKSPACE 'dist\IDCardCropper.exe'
+          $found = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Filter 'IDCardCropper.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 3 | ForEach-Object { $_.FullName }) -join '; '
+          Write-Output "::notice title=EXE path diagnostic::workspace=$env:GITHUB_WORKSPACE; expected=$exePath; found=$found"
           if (-not (Test-Path -LiteralPath $exePath)) {
+            Write-Output "::error title=EXE path check::Expected $exePath; found: $found"
             throw "Build succeeded but the EXE is missing at $exePath."
           }
           Get-Item -LiteralPath $exePath | Select-Object FullName, Length
