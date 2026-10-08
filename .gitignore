@@ -3,6 +3,7 @@
 __pycache__/
 *.egg-info/
 output/
+*_debug/
 build/
 dist/
 *.spec

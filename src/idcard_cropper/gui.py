@@ -122,11 +122,13 @@ class MainWindow(QMainWindow):
         self.process_selected_button = QPushButton("선택 항목 보정")
         self.process_all_button = QPushButton("전체 보정")
         self.print_button = QPushButton("보정 결과 인쇄")
+        self.open_diagnostics_button = QPushButton("단계별 진단 열기")
         self.open_output_button = QPushButton("결과 폴더 열기")
         actions.addWidget(self.process_selected_button)
         actions.addWidget(self.process_all_button)
         actions.addStretch(1)
         actions.addWidget(self.print_button)
+        actions.addWidget(self.open_diagnostics_button)
         actions.addWidget(self.open_output_button)
         layout.addLayout(actions)
 
@@ -142,8 +144,10 @@ class MainWindow(QMainWindow):
         self.process_all_button.clicked.connect(self.process_all)
         self.file_list.currentItemChanged.connect(self.selection_changed)
         self.print_button.clicked.connect(self.print_selected)
+        self.open_diagnostics_button.clicked.connect(self.open_diagnostics)
         self.open_output_button.clicked.connect(self.open_output)
         self.print_button.setEnabled(False)
+        self.open_diagnostics_button.setEnabled(False)
 
     @staticmethod
     def _preview_column(title: str, preview: Preview) -> QWidget:
@@ -234,6 +238,8 @@ class MainWindow(QMainWindow):
             message = result.message
             if result.quality_warning:
                 message += " " + result.quality_warning
+            if result.debug_dir:
+                message += f" 단계별 캡처 저장: {result.debug_dir}"
             self.status.setText(message)
 
     @staticmethod
@@ -248,6 +254,7 @@ class MainWindow(QMainWindow):
             self.source_preview.show_image(None)
             self.result_preview.show_image(None)
             self.print_button.setEnabled(False)
+            self.open_diagnostics_button.setEnabled(False)
 
     def display_path(self, path: Path) -> None:
         self.source_preview.show_image(path)
@@ -255,9 +262,19 @@ class MainWindow(QMainWindow):
         if result:
             self.result_preview.show_image(result.output_path or result.preview_path)
             self.print_button.setEnabled(bool(result.output_path and result.output_path.is_file()))
+            self.open_diagnostics_button.setEnabled(bool(result.debug_dir and result.debug_dir.is_dir()))
         else:
             self.result_preview.show_image(None)
             self.print_button.setEnabled(False)
+            self.open_diagnostics_button.setEnabled(False)
+
+    def open_diagnostics(self) -> None:
+        path = self.selected_path()
+        result = self.results.get(str(path)) if path else None
+        if not result or not result.debug_dir or not result.debug_dir.is_dir():
+            QMessageBox.information(self, "진단 자료 없음", "먼저 이미지를 보정하세요.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.debug_dir.resolve())))
 
     def print_selected(self) -> None:
         path = self.selected_path()

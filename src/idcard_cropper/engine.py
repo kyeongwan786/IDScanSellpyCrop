@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import shutil
 import sys
 import cv2
 import numpy as np
@@ -24,6 +26,7 @@ class CropResult:
     rotation: int | None = None
     quality_warning: str | None = None
     preview_path: Path | None = None
+    debug_dir: Path | None = None
 
 
 def _load_image(path: Path) -> np.ndarray:
@@ -62,7 +65,9 @@ def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
             and direction_delta(edges[2], edges[3]) <= 3.0)
 
 
-def _move_corners_inside_component(mask: np.ndarray, quad: np.ndarray) -> np.ndarray | None:
+def _move_corners_inside_component(
+    mask: np.ndarray, quad: np.ndarray, details: dict | None = None,
+) -> np.ndarray | None:
     """Inset all four corners equally until each lies inside the detected card."""
     tl, tr, br, bl = quad
 
@@ -108,6 +113,8 @@ def _move_corners_inside_component(mask: np.ndarray, quad: np.ndarray) -> np.nda
     # One shared inset keeps all four crop edges parallel. Use the deepest
     # corner entry so every point is inside the card rather than on scan paper.
     inset = max(required)
+    if details is not None:
+        details.update(corner_entry_px=required, shared_inset_px=inset)
     adjusted = np.array([
         corner + inset * (axis_a + axis_b)
         for corner, (axis_a, axis_b) in zip(quad, inward_axes)
@@ -150,7 +157,9 @@ def _background_lab(image: np.ndarray) -> np.ndarray:
     return np.median(border.reshape(-1, 3), axis=0).astype(np.float32)
 
 
-def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
+def _candidate_contour(
+    image: np.ndarray, debug: dict | None = None,
+) -> tuple[np.ndarray | None, float]:
     """Find the dominant non-background component and fit its outer quadrilateral."""
     h, w = image.shape[:2]
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -159,9 +168,12 @@ def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
     k = max(3, int(round(min(h, w) * 0.004)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     best: tuple[np.ndarray, float] | None = None
+    best_details: dict | None = None
+    thresholds_tried: list[float] = []
 
     # Multiple thresholds handle both faint card edges and patterned cards.
     for threshold in (7.0, 10.0, 14.0, 19.0, 25.0, 32.0):
+        thresholds_tried.append(threshold)
         mask = (distance >= threshold).astype(np.uint8) * 255
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
@@ -180,6 +192,7 @@ def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
         hull = cv2.convexHull(contour)
         perimeter = cv2.arcLength(hull, True)
         quad = None
+        fit_mode = "contour_quad"
         for epsilon in (0.012, 0.018, 0.024, 0.032, 0.042, 0.055):
             approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
@@ -198,25 +211,76 @@ def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
                     # genuine perspective distortion.
                     if _is_nearly_parallel_card(ordered):
                         ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
+                        fit_mode = "minimum_area_rectangle"
                     quad = ordered
                     break
         if quad is None:
             continue
 
-        quad = _move_corners_inside_component(component, quad)
-        if quad is None:
+        outer_quad = quad.copy()
+        inset_details: dict = {}
+        inner_quad = _move_corners_inside_component(component, quad, inset_details)
+        if inner_quad is None:
             continue
 
-        qarea = abs(cv2.contourArea(quad.reshape(-1, 1, 2)))
+        qarea = abs(cv2.contourArea(inner_quad.reshape(-1, 1, 2)))
         fill = min(1.0, cv2.contourArea(contour) / max(qarea, 1.0))
         # Prefer a substantial, compact component; weak fits are reviewed manually.
         score = min(1.0, area / max(h * w * 0.015, 1.0)) * (0.65 + 0.35 * fill)
         if best is None or score > best[1]:
-            best = (quad, float(score))
+            best = (inner_quad, float(score))
+            best_details = {
+                "outer_corners_xy": outer_quad.tolist(),
+                "inner_corners_xy": inner_quad.tolist(),
+                "selected_threshold_lab": threshold,
+                "component_area_px": area,
+                "component_fill_ratio": float(fill),
+                "fit_mode": fit_mode,
+                **inset_details,
+                "component_mask": component,
+            }
+    if debug is not None:
+        debug["thresholds_tried_lab"] = thresholds_tried
+        if best_details:
+            debug.update(best_details)
     return best if best else (None, 0.0)
 
 
-def _warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
+def _save_debug_image(folder: Path, name: str, image: np.ndarray) -> Path:
+    path = folder / name
+    if image.ndim == 2:
+        Image.fromarray(image.astype(np.uint8)).save(path)
+    else:
+        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(path, quality=94)
+    return path
+
+
+def _draw_debug_corners(image: np.ndarray, corners: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    marked = image.copy()
+    cv2.polylines(marked, [corners.astype(np.int32)], True, color, 3)
+    for index, point in enumerate(corners.astype(int)):
+        cv2.circle(marked, tuple(point), 5, (0, 0, 255), -1)
+        cv2.putText(marked, str(index + 1), tuple(point + 8), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (0, 0, 255), 2)
+    return marked
+
+
+def _write_debug_log(folder: Path, info: dict) -> None:
+    path = folder / "run.json"
+
+    def to_json(value):
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer, np.floating)):
+            return value.item()
+        raise TypeError(f"Unsupported debug value: {type(value).__name__}")
+
+    path.write_text(json.dumps(info, ensure_ascii=False, indent=2, default=to_json), encoding="utf-8")
+
+
+def _warp(image: np.ndarray, corners: np.ndarray, debug: dict | None = None) -> np.ndarray:
     tl, tr, br, bl = corners
     width = int(round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))))
     height = int(round(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))))
@@ -225,11 +289,16 @@ def _warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
     destination = np.array([[0, 0], [width - 1, 0],
                             [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
     matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), destination)
+    if debug is not None:
+        debug["perspective_transform_matrix"] = matrix
+        debug["warp_destination_size_px"] = [width, height]
     return cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE)
 
 
-def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
+def _read_rotation(
+    card: np.ndarray, score_log: list[dict] | None = None,
+) -> tuple[int | None, str | None]:
     """Choose orientation from local OCR confidence, without retaining recognized text."""
     try:
         import pytesseract
@@ -289,7 +358,12 @@ def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
                 confidences = [float(conf) for conf, word in zip(data["conf"], data["text"])
                                if word.strip() and float(conf) >= 0]
                 if confidences:
-                    scores.append((degrees, sum(confidences) / len(confidences), len(confidences)))
+                    average = sum(confidences) / len(confidences)
+                    scores.append((degrees, average, len(confidences)))
+                    if score_log is not None:
+                        score_log.append({"rotation_degrees": degrees,
+                                          "mean_confidence": average,
+                                          "recognized_token_count": len(confidences)})
             scores.sort(key=lambda item: item[1], reverse=True)
             if scores:
                 best = scores[0]
@@ -304,6 +378,9 @@ def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
         data = pytesseract.image_to_osd(card, output_type=Output.DICT)
         confidence = float(data.get("orientation_conf", 0))
         rotation = int(data.get("rotate", 0)) % 360
+        if score_log is not None:
+            score_log.append({"osd_rotation_degrees": rotation,
+                              "orientation_confidence": confidence})
         if rotation in (0, 90, 180, 270) and confidence >= 2.0:
             return rotation, None
         return None, "문자 방향 판별 신뢰도가 낮아 회전 확인이 필요합니다."
@@ -344,38 +421,81 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     except Exception:
         return CropResult("failed", "이미지를 열 수 없습니다.")
 
-    corners, confidence = _candidate_contour(image)
-    if corners is not None and confidence >= 0.42:
-        # Level the detected card edge before drawing diagnostics or cropping.
-        image, corners = _deskew_scan(image, corners)
     destination.mkdir(parents=True, exist_ok=True)
+    debug_dir = destination / f"{source.stem}_debug"
+    if debug_dir.exists():
+        shutil.rmtree(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    info: dict = {
+        "source_file": source.name,
+        "source_size_px": [int(image.shape[1]), int(image.shape[0])],
+        "status": "processing",
+        "ocr_text_saved": False,
+    }
+    _save_debug_image(debug_dir, "00_source.jpg", image)
+
+    detection: dict = {}
+    corners, confidence = _candidate_contour(image, detection)
+    component_mask = detection.pop("component_mask", None)
+    info["detection"] = {key: value for key, value in detection.items()}
+    info["detection_confidence"] = confidence
+    if "outer_corners_xy" in detection:
+        outer = np.asarray(detection["outer_corners_xy"], dtype=np.float32)
+        _save_debug_image(debug_dir, "01_outer_candidate_points.jpg",
+                          _draw_debug_corners(image, outer, (0, 180, 255)))
+    if corners is not None:
+        _save_debug_image(debug_dir, "02_inner_crop_points.jpg",
+                          _draw_debug_corners(image, corners, (0, 200, 0)))
+    if component_mask is not None:
+        _save_debug_image(debug_dir, "03_selected_component_mask.png", component_mask)
+
+    if corners is not None and confidence >= 0.42:
+        edge = corners[1] - corners[0]
+        info["deskew_angle_degrees"] = float(np.degrees(np.arctan2(edge[1], edge[0])))
+        image, corners = _deskew_scan(image, corners)
+        info["deskewed_size_px"] = [int(image.shape[1]), int(image.shape[0])]
+        info["deskewed_corners_xy"] = corners
+        _save_debug_image(debug_dir, "04_deskewed_points.jpg",
+                          _draw_debug_corners(image, corners, (0, 200, 0)))
+
     diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
     diagnostic = image.copy()
     if corners is not None:
-        cv2.polylines(diagnostic, [corners.astype(np.int32)], True, (0, 200, 0), 3)
-        for i, point in enumerate(corners.astype(int)):
-            cv2.circle(diagnostic, tuple(point), 5, (0, 0, 255), -1)
-            cv2.putText(diagnostic, str(i + 1), tuple(point + 8), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 0, 255), 2)
+        diagnostic = _draw_debug_corners(diagnostic, corners, (0, 200, 0))
     Image.fromarray(cv2.cvtColor(diagnostic, cv2.COLOR_BGR2RGB)).save(diagnostic_path, quality=92)
 
     if corners is None or confidence < 0.42:
+        info.update(status="manual_review", message="카드 외곽을 확실하게 검출하지 못했습니다.")
+        _write_debug_log(debug_dir, info)
         return CropResult("manual_review", "카드 외곽을 확실하게 검출하지 못했습니다.",
-                          diagnostic_path=diagnostic_path, confidence=confidence)
+                          diagnostic_path=diagnostic_path, confidence=confidence,
+                          debug_dir=debug_dir)
     try:
-        # First rectify the detected card plane. Keep the full card for OCR so
-        # orientation scoring cannot lose the top/edge text to an early crop.
-        card = _warp(image, corners)
+        card = _warp(image, corners, info)
     except Exception:
+        info.update(status="manual_review", message="원근 보정에 실패했습니다.")
+        _write_debug_log(debug_dir, info)
         return CropResult("manual_review", "원근 보정에 실패했습니다.",
-                          diagnostic_path=diagnostic_path, confidence=confidence)
+                          diagnostic_path=diagnostic_path, confidence=confidence,
+                          debug_dir=debug_dir)
 
-    rotation, orientation_warning = _read_rotation(card)
+    info["warped_card_size_px"] = [int(card.shape[1]), int(card.shape[0])]
+    _save_debug_image(debug_dir, "05_warped_card_before_orientation.jpg", card)
+
+    rotation_scores: list[dict] = []
+    rotation, orientation_warning = _read_rotation(card, rotation_scores)
+    info["ocr_rotation_scores"] = rotation_scores
+    info["ocr_selected_rotation_degrees"] = rotation
     if rotation is None:
         preview_path = _save_crop_preview(card, source, destination)
+        preview = _load_image(preview_path)
+        _save_debug_image(debug_dir, "06_orientation_review_preview.jpg", preview)
+        info.update(status="manual_review", message=orientation_warning or "방향을 확인해야 합니다.",
+                    preview_path=preview_path)
+        _write_debug_log(debug_dir, info)
         return CropResult("manual_review", orientation_warning or "방향을 확인해야 합니다.",
                           diagnostic_path=diagnostic_path, confidence=confidence,
-                          preview_path=preview_path)
+                          preview_path=preview_path, debug_dir=debug_dir)
     applied_rotation = rotation or 0
     if applied_rotation == 90:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
@@ -386,6 +506,8 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     # Landscape print dimensions; rotate portrait cards to landscape without altering content.
     if card.shape[0] > card.shape[1]:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+    info["upright_card_size_px"] = [int(card.shape[1]), int(card.shape[0])]
+    _save_debug_image(debug_dir, "06_upright_card_before_resize.jpg", card)
     warning = None
     if min(card.shape[:2]) < 602:
         warning = "원본 카드 해상도가 낮아 확대 출력 시 선명도가 제한됩니다."
@@ -393,5 +515,11 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     output_path = destination / f"{source.stem}_8.1x5.1cm.jpg"
     rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
     Image.fromarray(rgb).save(output_path, format="JPEG", quality=95, dpi=(300, 300), subsampling=0)
+    info.update(status="complete", message="보정 및 인화 규격 변환이 완료되었습니다.",
+                quality_warning=warning, output_path=output_path,
+                print_size_px=list(PRINT_SIZE), output_dpi=300)
+    _save_debug_image(debug_dir, "07_final_8.1x5.1cm.jpg", final)
+    _write_debug_log(debug_dir, info)
     return CropResult("complete", "보정 및 인화 규격 변환이 완료되었습니다.", output_path,
-                      diagnostic_path, confidence, applied_rotation, warning)
+                      diagnostic_path, confidence, applied_rotation, warning,
+                      debug_dir=debug_dir)

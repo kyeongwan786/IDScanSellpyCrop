@@ -33,6 +33,8 @@ def main() -> None:
             print(f"  결과: {result.output_path}")
         if result.diagnostic_path:
             print(f"  진단: {result.diagnostic_path}")
+        if result.debug_dir:
+            print(f"  단계별 로그/캡처: {result.debug_dir}")
         if result.quality_warning:
             print(f"  품질 안내: {result.quality_warning}")
 
