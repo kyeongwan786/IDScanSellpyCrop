@@ -109,6 +109,7 @@ if errorlevel 1 (
 
 echo [5/6] Building one-file Windows x64 GUI executable...
 set "PYINSTALLER_DIST=%~dp0dist"
+if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
     --distpath "%PYINSTALLER_DIST%" ^
     --paths src ^
@@ -130,12 +131,6 @@ echo ::notice title=Built EXE path::%PYINSTALLER_DIST%\IDCardCropper.exe
 "%VENV_PY%" -c "import struct,sys; f=open(sys.argv[1],'rb'); d=f.read(64); assert d[:2]==b'MZ','Not a PE executable'; f.seek(struct.unpack_from('<I',d,60)[0]); assert f.read(4)==b'PE\0\0','Invalid PE signature'; machine=struct.unpack('<H',f.read(2))[0]; print('PE machine:',hex(machine)); sys.exit(0 if machine==0x8664 else 1)" "%PYINSTALLER_DIST%\IDCardCropper.exe"
 if errorlevel 1 (
     echo ERROR: The generated EXE is not Windows x64 AMD64. Build failed.
-    exit /b 1
-)
-
-copy /y "%PYINSTALLER_DIST%\IDCardCropper.exe" "%~dp0IDCardCropper.exe" >nul
-if errorlevel 1 (
-    echo ERROR: Could not copy the verified EXE beside the build script.
     exit /b 1
 )
 
