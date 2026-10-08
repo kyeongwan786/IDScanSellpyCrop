@@ -53,8 +53,14 @@ jobs:
           $env:IDCARD_BUILD_DIST = Join-Path $env:GITHUB_WORKSPACE 'dist'
           Set-Location -LiteralPath $env:GITHUB_WORKSPACE
           $batchPath = Join-Path $env:GITHUB_WORKSPACE 'build_windows.bat'
-          & cmd.exe /d /c $batchPath
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $batchOutput = @(& cmd.exe /d /c $batchPath 2>&1)
+          $batchExitCode = $LASTEXITCODE
+          $batchOutput | ForEach-Object { Write-Host $_ }
+          if ($batchExitCode -ne 0) { exit $batchExitCode }
+          $buildLine = $batchOutput | Where-Object { $_ -match '^Build complete:' } | Select-Object -Last 1
+          $reportedPath = '<no build path reported>'
+          if ($buildLine -match 'Build complete:\s*(.+?)\s+\(Windows x64\)') { $reportedPath = $Matches[1].Trim() }
+          Write-Output "::notice title=Batch reported EXE path::$reportedPath"
 
       - name: Confirm EXE is present for upload
         shell: pwsh
