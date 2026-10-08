@@ -48,11 +48,9 @@ jobs:
           $architecture = & $pythonPath -c "import platform; print(platform.machine())"
           Write-Host "Using Python: $pythonPath ($architecture)"
           if ($architecture -ne 'AMD64') { throw "Expected AMD64 Python, got $architecture." }
-          $env:IDCARD_PYTHON_X64 = $pythonPath
-          $env:TESSERACT_DIR = Join-Path $env:ProgramFiles 'Tesseract-OCR'
           Set-Location -LiteralPath $env:GITHUB_WORKSPACE
           $batchPath = Join-Path $env:GITHUB_WORKSPACE 'build_windows.bat'
-          $batchCommand = "call `"$batchPath`" --github-actions"
+          $batchCommand = "call `"$batchPath`" --github-actions `"$pythonPath`""
           $batchOutput = @(& cmd.exe /d /c $batchCommand 2>&1)
           $batchExitCode = $LASTEXITCODE
           $batchOutput | ForEach-Object { Write-Host $_ }

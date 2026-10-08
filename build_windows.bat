@@ -3,6 +3,20 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo [1/6] Locating Windows x64 Python 3.12...
+if /I "%~1"=="--github-actions" (
+    if not exist "%~2" (
+        echo ERROR: The Python path supplied by GitHub Actions does not exist: "%~2"
+        exit /b 1
+    )
+    call :CHECK_AMD64 "%~2"
+    if errorlevel 1 (
+        echo ERROR: The Python path supplied by GitHub Actions is not AMD64.
+        exit /b 1
+    )
+    set "BASE_PY=%~2"
+    goto BASE_FOUND
+)
+
 if defined IDCARD_PYTHON_X64 if not "%IDCARD_PYTHON_X64%"=="" (
     set "BASE_PY=%IDCARD_PYTHON_X64%"
     if not exist "%BASE_PY%" (
