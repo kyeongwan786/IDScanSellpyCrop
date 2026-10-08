@@ -389,14 +389,34 @@ def _read_rotation(
         return None, f"Tesseract OCR 오류 ({type(exc).__name__}): {detail}"
 
 
-def _fit_print_size(card: np.ndarray) -> np.ndarray:
+def _crop_to_print_aspect(card: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Center-crop symmetrically to the print ratio without stretching the card."""
+    target_w, target_h = PRINT_SIZE
+    h, w = card.shape[:2]
+    target_ratio = target_w / target_h
+    source_ratio = w / h
+    if source_ratio > target_ratio:
+        cropped_w = max(1, int(round(h * target_ratio)))
+        left = max(0, (w - cropped_w) // 2)
+        right = left + cropped_w
+        return card[:, left:right], (left, 0, cropped_w, h)
+    cropped_h = max(1, int(round(w / target_ratio)))
+    top = max(0, (h - cropped_h) // 2)
+    bottom = top + cropped_h
+    return card[top:bottom, :], (0, top, w, cropped_h)
+
+
+def _resize_to_print_size(card: np.ndarray) -> np.ndarray:
     target_w, target_h = PRINT_SIZE
     h, w = card.shape[:2]
     shrinking = target_w < w or target_h < h
-    # Fill the print dimensions exactly; this avoids retaining scan background
-    # as letterboxing. The small aspect-ratio adjustment is explicit and avoids cropping.
     return cv2.resize(card, (target_w, target_h),
                       interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_CUBIC)
+
+
+def _fit_print_size(card: np.ndarray) -> np.ndarray:
+    cropped, _ = _crop_to_print_aspect(card)
+    return _resize_to_print_size(cropped)
 
 
 def _save_crop_preview(card: np.ndarray, source: Path, destination: Path) -> Path:
@@ -508,17 +528,21 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
     info["upright_card_size_px"] = [int(card.shape[1]), int(card.shape[0])]
     _save_debug_image(debug_dir, "06_upright_card_before_resize.jpg", card)
+    aspect_cropped, aspect_crop_bounds = _crop_to_print_aspect(card)
+    info["print_aspect_crop_bounds_xywh"] = list(aspect_crop_bounds)
+    info["print_aspect_crop_size_px"] = [int(aspect_cropped.shape[1]), int(aspect_cropped.shape[0])]
+    _save_debug_image(debug_dir, "07_print_aspect_crop.jpg", aspect_cropped)
     warning = None
     if min(card.shape[:2]) < 602:
         warning = "원본 카드 해상도가 낮아 확대 출력 시 선명도가 제한됩니다."
-    final = _fit_print_size(card)
+    final = _resize_to_print_size(aspect_cropped)
     output_path = destination / f"{source.stem}_8.1x5.1cm.jpg"
     rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
     Image.fromarray(rgb).save(output_path, format="JPEG", quality=95, dpi=(300, 300), subsampling=0)
     info.update(status="complete", message="보정 및 인화 규격 변환이 완료되었습니다.",
                 quality_warning=warning, output_path=output_path,
                 print_size_px=list(PRINT_SIZE), output_dpi=300)
-    _save_debug_image(debug_dir, "07_final_8.1x5.1cm.jpg", final)
+    _save_debug_image(debug_dir, "08_final_8.1x5.1cm.jpg", final)
     _write_debug_log(debug_dir, info)
     return CropResult("complete", "보정 및 인화 규격 변환이 완료되었습니다.", output_path,
                       diagnostic_path, confidence, applied_rotation, warning,
