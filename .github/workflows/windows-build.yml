@@ -51,7 +51,9 @@ jobs:
           $env:IDCARD_PYTHON_X64 = $pythonPath
           $env:TESSERACT_DIR = Join-Path $env:ProgramFiles 'Tesseract-OCR'
           $env:IDCARD_BUILD_DIST = Join-Path $env:GITHUB_WORKSPACE 'dist'
-          & cmd.exe /d /c build_windows.bat
+          Set-Location -LiteralPath $env:GITHUB_WORKSPACE
+          $batchPath = Join-Path $env:GITHUB_WORKSPACE 'build_windows.bat'
+          & cmd.exe /d /c $batchPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Confirm EXE is present for upload
