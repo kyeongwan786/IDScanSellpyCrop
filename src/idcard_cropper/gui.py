@@ -253,7 +253,7 @@ class MainWindow(QMainWindow):
         self.source_preview.show_image(path)
         result = self.results.get(str(path))
         if result:
-            self.result_preview.show_image(result.output_path or result.diagnostic_path)
+            self.result_preview.show_image(result.output_path or result.preview_path)
             self.print_button.setEnabled(bool(result.output_path and result.output_path.is_file()))
         else:
             self.result_preview.show_image(None)

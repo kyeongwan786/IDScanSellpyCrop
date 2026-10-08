@@ -23,6 +23,7 @@ class CropResult:
     confidence: float = 0.0
     rotation: int | None = None
     quality_warning: str | None = None
+    preview_path: Path | None = None
 
 
 def _load_image(path: Path) -> np.ndarray:
@@ -213,6 +214,17 @@ def _fit_print_size(card: np.ndarray) -> np.ndarray:
                       interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_CUBIC)
 
 
+def _save_crop_preview(card: np.ndarray, source: Path, destination: Path) -> Path:
+    """Save a card-only preview at print dimensions, even if OCR needs review."""
+    if card.shape[0] > card.shape[1]:
+        card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+    preview = _fit_print_size(card)
+    path = destination / f"{source.stem}_crop_preview.jpg"
+    rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(path, format="JPEG", quality=95, dpi=(300, 300), subsampling=0)
+    return path
+
+
 def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     """Process one JPG/PNG. Uncertain detection or orientation never saves a final image."""
     source = Path(input_path)
@@ -247,8 +259,10 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
 
     rotation, orientation_warning = _read_rotation(card)
     if rotation is None:
+        preview_path = _save_crop_preview(card, source, destination)
         return CropResult("manual_review", orientation_warning or "방향을 확인해야 합니다.",
-                          diagnostic_path=diagnostic_path, confidence=confidence)
+                          diagnostic_path=diagnostic_path, confidence=confidence,
+                          preview_path=preview_path)
     applied_rotation = rotation or 0
     if applied_rotation == 90:
         card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
