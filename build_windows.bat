@@ -110,13 +110,6 @@ if errorlevel 1 (
 echo [5/6] Building one-file Windows x64 GUI executable...
 set "PYINSTALLER_DIST=dist"
 if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
-if defined RUNNER_TEMP (
-    > "%RUNNER_TEMP%\idcard-build-path.txt" echo batch=%~f0
-    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo cwd=%CD%
-    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo dist=%PYINSTALLER_DIST%
-    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo workspace=%GITHUB_WORKSPACE%
-)
-echo ::notice title=Build output directory::%PYINSTALLER_DIST%
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
     --distpath "%PYINSTALLER_DIST%" ^
     --paths src ^
@@ -139,6 +132,14 @@ echo ::notice title=Built EXE path::%PYINSTALLER_DIST%\IDCardCropper.exe
 if errorlevel 1 (
     echo ERROR: The generated EXE is not Windows x64 AMD64. Build failed.
     exit /b 1
+)
+
+if defined IDCARD_BUILD_ROOT (
+    copy /y "%PYINSTALLER_DIST%\IDCardCropper.exe" "%IDCARD_BUILD_ROOT%\IDCardCropper.exe" >nul
+    if errorlevel 1 (
+        echo ERROR: Could not copy the verified EXE to "%IDCARD_BUILD_ROOT%\IDCardCropper.exe".
+        exit /b 1
+    )
 )
 
 echo Build complete: %PYINSTALLER_DIST%\IDCardCropper.exe (Windows x64)
