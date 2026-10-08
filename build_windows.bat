@@ -108,7 +108,10 @@ if errorlevel 1 (
 )
 
 echo [5/6] Building one-file Windows x64 GUI executable...
+set "PYINSTALLER_DIST=dist"
+if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
+    --distpath "%PYINSTALLER_DIST%" ^
     --paths src ^
     --collect-all cv2 ^
     --collect-all numpy ^
@@ -120,17 +123,17 @@ echo [5/6] Building one-file Windows x64 GUI executable...
 if errorlevel 1 exit /b 1
 
 echo [6/6] Verifying the generated EXE is Windows AMD64...
-if not exist "dist\IDCardCropper.exe" (
-    echo ERROR: PyInstaller did not create dist\IDCardCropper.exe.
+if not exist "%PYINSTALLER_DIST%\IDCardCropper.exe" (
+    echo ERROR: PyInstaller did not create "%PYINSTALLER_DIST%\IDCardCropper.exe".
     exit /b 1
 )
-"%VENV_PY%" -c "import struct,sys; f=open(sys.argv[1],'rb'); d=f.read(64); assert d[:2]==b'MZ','Not a PE executable'; f.seek(struct.unpack_from('<I',d,60)[0]); assert f.read(4)==b'PE\0\0','Invalid PE signature'; machine=struct.unpack('<H',f.read(2))[0]; print('PE machine:',hex(machine)); sys.exit(0 if machine==0x8664 else 1)" "dist\IDCardCropper.exe"
+"%VENV_PY%" -c "import struct,sys; f=open(sys.argv[1],'rb'); d=f.read(64); assert d[:2]==b'MZ','Not a PE executable'; f.seek(struct.unpack_from('<I',d,60)[0]); assert f.read(4)==b'PE\0\0','Invalid PE signature'; machine=struct.unpack('<H',f.read(2))[0]; print('PE machine:',hex(machine)); sys.exit(0 if machine==0x8664 else 1)" "%PYINSTALLER_DIST%\IDCardCropper.exe"
 if errorlevel 1 (
     echo ERROR: The generated EXE is not Windows x64 AMD64. Build failed.
     exit /b 1
 )
 
-echo Build complete: dist\IDCardCropper.exe (Windows x64)
+echo Build complete: %PYINSTALLER_DIST%\IDCardCropper.exe (Windows x64)
 exit /b 0
 
 :CHECK_AMD64

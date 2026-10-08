@@ -50,6 +50,7 @@ jobs:
           if ($architecture -ne 'AMD64') { throw "Expected AMD64 Python, got $architecture." }
           $env:IDCARD_PYTHON_X64 = $pythonPath
           $env:TESSERACT_DIR = Join-Path $env:ProgramFiles 'Tesseract-OCR'
+          $env:IDCARD_BUILD_DIST = Join-Path $env:GITHUB_WORKSPACE 'dist'
           & cmd.exe /d /c build_windows.bat
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
