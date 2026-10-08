@@ -43,6 +43,26 @@ def _order_points(points: np.ndarray) -> np.ndarray:
     )  # top-left, top-right, bottom-right, bottom-left
 
 
+def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
+    """Return true when a scan is a rotated rectangle with negligible perspective."""
+    tl, tr, br, bl = quad
+    edges = (tr - tl, br - bl, bl - tl, br - tr)
+    lengths = [float(np.linalg.norm(edge)) for edge in edges]
+    if min(lengths) <= 0:
+        return False
+
+    def direction_delta(a: np.ndarray, b: np.ndarray) -> float:
+        angle_a = float(np.degrees(np.arctan2(a[1], a[0])))
+        angle_b = float(np.degrees(np.arctan2(b[1], b[0])))
+        return abs((angle_a - angle_b + 90.0) % 180.0 - 90.0)
+
+    width_delta = abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1])
+    height_delta = abs(lengths[2] - lengths[3]) / max(lengths[2], lengths[3])
+    return (max(width_delta, height_delta) <= 0.04
+            and direction_delta(edges[0], edges[1]) <= 3.0
+            and direction_delta(edges[2], edges[3]) <= 3.0)
+
+
 def _background_lab(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     band = max(2, int(min(h, w) * 0.025))
@@ -95,6 +115,13 @@ def _candidate_contour(image: np.ndarray) -> tuple[np.ndarray | None, float]:
                            np.linalg.norm(ordered[2] - ordered[1]))
                 ratio = max(np.mean(widths), np.mean(heights)) / max(1.0, min(np.mean(widths), np.mean(heights)))
                 if 1.35 <= ratio <= 2.05:
+                    # Scans are usually a rotated rectangle, not a perspective
+                    # view. A minimum-area rectangle keeps opposite crop edges
+                    # parallel and avoids one corner being pulled inward by a
+                    # rounded/low-contrast card edge. Keep the fitted quad for
+                    # genuine perspective distortion.
+                    if _is_nearly_parallel_card(ordered):
+                        ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
                     quad = ordered
                     break
         if quad is None:
