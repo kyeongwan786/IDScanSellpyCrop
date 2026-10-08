@@ -26,4 +26,4 @@ idcard-crop-gui = "idcard_cropper.gui:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-idcard_cropper = ["data/*.traineddata"]
+idcard_cropper = ["tessdata/*.traineddata"]

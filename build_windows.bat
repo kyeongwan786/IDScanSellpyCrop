@@ -105,21 +105,27 @@ if not exist "%TESSERACT_DIR%\tesseract.exe" (
 )
 
 if exist "build\win-tesseract" rmdir /s /q "build\win-tesseract"
-mkdir "build\win-tesseract"
+mkdir "build\win-tesseract\tessdata"
 if errorlevel 1 exit /b 1
 copy /y "%TESSERACT_DIR%\tesseract.exe" "build\win-tesseract\tesseract.exe" >nul
 if errorlevel 1 exit /b 1
 for %%F in ("%TESSERACT_DIR%\*.dll") do if exist "%%~fF" copy /y "%%~fF" "build\win-tesseract\" >nul
+copy /y "src\idcard_cropper\tessdata\kor.traineddata" "build\win-tesseract\tessdata\kor.traineddata" >nul
+if errorlevel 1 exit /b 1
 "build\win-tesseract\tesseract.exe" --version
 if errorlevel 1 (
     echo ERROR: The staged Tesseract executable could not start.
     exit /b 1
 )
-"build\win-tesseract\tesseract.exe" --list-langs --tessdata-dir "src\idcard_cropper\data"
+set "TESSDATA_PREFIX=%CD%\build\win-tesseract"
+"build\win-tesseract\tesseract.exe" --list-langs > "build\win-tesseract\languages.txt" 2>&1
+findstr /I /X "kor" "build\win-tesseract\languages.txt" >nul
 if errorlevel 1 (
     echo ERROR: Tesseract could not read the bundled Korean language model.
+    type "build\win-tesseract\languages.txt"
     exit /b 1
 )
+del /q "build\win-tesseract\languages.txt" >nul 2>&1
 
 echo [5/6] Building one-file Windows x64 GUI executable...
 for %%I in ("%~dp0.") do set "PROJECT_ROOT=%%~fI"
@@ -132,7 +138,7 @@ if /I "%~1"=="--github-actions" set "PYINSTALLER_DIST=%PROJECT_ROOT%"
     --collect-all numpy ^
     --collect-all pytesseract ^
     --hidden-import PySide6.QtPrintSupport ^
-    --add-data "src\idcard_cropper\data\kor.traineddata;idcard_cropper\data" ^
+    --add-data "src\idcard_cropper\tessdata\kor.traineddata;tessdata" ^
     --add-binary "build\win-tesseract;tesseract" ^
     run_gui.py
 if errorlevel 1 exit /b 1

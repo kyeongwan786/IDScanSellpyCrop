@@ -133,10 +133,17 @@ def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
             else:
                 return None, "패키지에 포함된 Tesseract 실행 파일을 찾지 못했습니다. 다시 빌드해야 합니다."
 
-        korean_model = app_root / "idcard_cropper" / "data" / "kor.traineddata"
+        tessdata_dir = app_root / "tessdata"
+        korean_model = tessdata_dir / "kor.traineddata"
         if not korean_model.is_file():
-            korean_model = Path(__file__).parent / "data" / "kor.traineddata"
+            tessdata_dir = Path(__file__).parent / "tessdata"
+            korean_model = tessdata_dir / "kor.traineddata"
         if korean_model.is_file():
+            # Tesseract reads models from TESSDATA_PREFIX/tessdata. Passing an
+            # absolute Windows path through pytesseract's config parser strips
+            # backslashes or retains quotes, so use the environment instead.
+            import os
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir.parent)
             try:
                 pytesseract.get_tesseract_version()
             except Exception as exc:
@@ -168,7 +175,7 @@ def _read_rotation(card: np.ndarray) -> tuple[int | None, str | None]:
             for degrees, candidate in rotations.items():
                 data = pytesseract.image_to_data(
                     candidate, lang="kor", output_type=Output.DICT,
-                    config=f'--psm 6 --tessdata-dir "{korean_model.parent}"',
+                    config="--psm 6",
                 )
                 confidences = [float(conf) for conf, word in zip(data["conf"], data["text"])
                                if word.strip() and float(conf) >= 0]
