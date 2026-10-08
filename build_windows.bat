@@ -126,6 +126,11 @@ if errorlevel 1 (
     exit /b 1
 )
 del /q "build\win-tesseract\languages.txt" >nul 2>&1
+"%VENV_PY%" -c "import numpy as np,pytesseract; from pathlib import Path; root=Path('build/win-tesseract'); pytesseract.pytesseract.tesseract_cmd=str(root/'tesseract.exe'); pytesseract.image_to_data(np.full((96,256,3),255,dtype=np.uint8),lang='kor',config='--psm 6'); print('Korean OCR smoke test passed')"
+if errorlevel 1 (
+    echo ERROR: pytesseract could not load the bundled Korean language model.
+    exit /b 1
+)
 
 echo [5/6] Building one-file Windows x64 GUI executable...
 for %%I in ("%~dp0.") do set "PROJECT_ROOT=%%~fI"
