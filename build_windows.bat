@@ -110,6 +110,12 @@ if errorlevel 1 (
 echo [5/6] Building one-file Windows x64 GUI executable...
 set "PYINSTALLER_DIST=dist"
 if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
+if defined RUNNER_TEMP (
+    > "%RUNNER_TEMP%\idcard-build-path.txt" echo batch=%~f0
+    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo cwd=%CD%
+    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo dist=%PYINSTALLER_DIST%
+    >> "%RUNNER_TEMP%\idcard-build-path.txt" echo workspace=%GITHUB_WORKSPACE%
+)
 echo ::notice title=Build output directory::%PYINSTALLER_DIST%
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
     --distpath "%PYINSTALLER_DIST%" ^
