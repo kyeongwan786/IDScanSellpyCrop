@@ -37,9 +37,8 @@ jobs:
           if (-not (Test-Path (Join-Path $tesseractDir 'tesseract.exe'))) {
             throw "Tesseract was not found at $tesseractDir."
           }
-          "TESSERACT_DIR=$tesseractDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Verify Python architecture
+      - name: Build and verify EXE
         shell: pwsh
         run: |
           $pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
@@ -47,13 +46,12 @@ jobs:
             throw "Could not determine the Python executable path."
           }
           $architecture = & $pythonPath -c "import platform; print(platform.machine())"
-          Write-Host "Python: $pythonPath ($architecture)"
+          Write-Host "Using Python: $pythonPath ($architecture)"
           if ($architecture -ne 'AMD64') { throw "Expected AMD64 Python, got $architecture." }
-          "IDCARD_PYTHON_X64=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Build and verify EXE
-        shell: cmd
-        run: build_windows.bat
+          $env:IDCARD_PYTHON_X64 = $pythonPath
+          $env:TESSERACT_DIR = Join-Path $env:ProgramFiles 'Tesseract-OCR'
+          & cmd.exe /d /c build_windows.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v7
