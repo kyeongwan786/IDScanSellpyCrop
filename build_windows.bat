@@ -109,7 +109,7 @@ if errorlevel 1 (
 
 echo [5/6] Building one-file Windows x64 GUI executable...
 set "PYINSTALLER_DIST=%~dp0dist"
-if defined IDCARD_BUILD_DIST set "PYINSTALLER_DIST=%IDCARD_BUILD_DIST%"
+if /I "%~1"=="--github-actions" set "PYINSTALLER_DIST=%~dp0"
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name IDCardCropper ^
     --distpath "%PYINSTALLER_DIST%" ^
     --paths src ^
