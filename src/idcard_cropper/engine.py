@@ -115,6 +115,30 @@ def _move_corners_inside_component(mask: np.ndarray, quad: np.ndarray) -> np.nda
     return adjusted
 
 
+def _deskew_scan(image: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate the scan so the detected card edge is horizontal before cropping."""
+    edge = corners[1] - corners[0]
+    angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
+    if abs(angle) < 0.05:
+        return image, corners
+
+    height, width = image.shape[:2]
+    center = (width / 2.0, height / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cosine, sine = abs(matrix[0, 0]), abs(matrix[0, 1])
+    new_width = int(round(height * sine + width * cosine))
+    new_height = int(round(height * cosine + width * sine))
+    matrix[0, 2] += new_width / 2.0 - center[0]
+    matrix[1, 2] += new_height / 2.0 - center[1]
+
+    rotated = cv2.warpAffine(
+        image, matrix, (new_width, new_height), flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255),
+    )
+    aligned_corners = cv2.transform(corners[None, :, :], matrix)[0]
+    return rotated, aligned_corners
+
+
 def _background_lab(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     band = max(2, int(min(h, w) * 0.025))
@@ -321,6 +345,9 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         return CropResult("failed", "이미지를 열 수 없습니다.")
 
     corners, confidence = _candidate_contour(image)
+    if corners is not None and confidence >= 0.42:
+        # Level the detected card edge before drawing diagnostics or cropping.
+        image, corners = _deskew_scan(image, corners)
     destination.mkdir(parents=True, exist_ok=True)
     diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
     diagnostic = image.copy()
