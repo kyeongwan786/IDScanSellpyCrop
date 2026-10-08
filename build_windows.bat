@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo [1/6] Locating Windows x64 Python 3.12...
-if defined IDCARD_PYTHON_X64 (
+if defined IDCARD_PYTHON_X64 if not "%IDCARD_PYTHON_X64%"=="" (
     set "BASE_PY=%IDCARD_PYTHON_X64%"
     if not exist "%BASE_PY%" (
         echo ERROR: IDCARD_PYTHON_X64 does not exist: "%BASE_PY%"

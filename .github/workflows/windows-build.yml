@@ -42,8 +42,11 @@ jobs:
       - name: Verify Python architecture
         shell: pwsh
         run: |
-          $pythonPath = (Get-Command python).Source
-          $architecture = python -c "import platform; print(platform.machine())"
+          $pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
+          if (-not $pythonPath -or -not (Test-Path -LiteralPath $pythonPath)) {
+            throw "Could not determine the Python executable path."
+          }
+          $architecture = & $pythonPath -c "import platform; print(platform.machine())"
           Write-Host "Python: $pythonPath ($architecture)"
           if ($architecture -ne 'AMD64') { throw "Expected AMD64 Python, got $architecture." }
           "IDCARD_PYTHON_X64=$pythonPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
