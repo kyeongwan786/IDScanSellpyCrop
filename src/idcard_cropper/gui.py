@@ -6,11 +6,15 @@ import json
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings
-from PySide6.QtGui import QDesktopServices, QImage, QPageLayout, QPageSize, QPainter, QPixmap
+import cv2
+import numpy as np
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings, QPointF
+from PySide6.QtGui import (QDesktopServices, QImage, QPageLayout, QPageSize, QPainter,
+                           QPixmap, QPen, QColor, QPolygonF)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -26,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .engine import CropResult, process_image
+from .engine import CropResult, _load_image, _rect_corners, _rectified_crop, process_image
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
@@ -84,6 +88,10 @@ class Preview(QLabel):
         self._pixmap = QPixmap(str(path)) if path and path.is_file() else None
         self._render()
 
+    def show_pixmap(self, pixmap: QPixmap) -> None:
+        self._pixmap = pixmap
+        self._render()
+
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
         super().resizeEvent(event)
         self._render()
@@ -97,17 +105,157 @@ class Preview(QLabel):
             self.setText(self._placeholder)
 
 
+class CropEditor(Preview):
+    """Interactive rotated-rectangle editor over the source scan."""
+
+    rectangle_changed = Signal(object)
+    HANDLE_RADIUS = 12.0
+
+    def __init__(self, title: str) -> None:
+        super().__init__(title)
+        self._source: np.ndarray | None = None
+        self.rectangle: tuple[float, float, float, float, float] | None = None
+        self._drag: str | None = None
+        self._drag_start = QPointF()
+        self._drag_rect: tuple[float, float, float, float, float] | None = None
+
+    def load_source(self, path: Path | None) -> None:
+        self._source = _load_image(path) if path and path.is_file() else None
+        self.show_image(path)
+        if self._source is None:
+            self.set_rectangle(None)
+
+    def set_rectangle(self, rect) -> None:
+        self.rectangle = tuple(float(value) for value in rect) if rect else None
+        self.update()
+
+    def _image_view(self) -> tuple[QRectF, float]:
+        if self._pixmap is None or self._pixmap.isNull():
+            return QRectF(), 1.0
+        bounds = self.contentsRect()
+        size = self._pixmap.size().scaled(bounds.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        x = bounds.x() + (bounds.width() - size.width()) / 2.0
+        y = bounds.y() + (bounds.height() - size.height()) / 2.0
+        scale = size.width() / max(1, self._pixmap.width())
+        return QRectF(x, y, size.width(), size.height()), scale
+
+    def _to_view(self, point) -> QPointF:
+        bounds, scale = self._image_view()
+        return QPointF(bounds.x() + float(point[0]) * scale,
+                       bounds.y() + float(point[1]) * scale)
+
+    def _to_image(self, point: QPointF) -> np.ndarray:
+        bounds, scale = self._image_view()
+        return np.array([(point.x() - bounds.x()) / scale,
+                         (point.y() - bounds.y()) / scale], dtype=np.float32)
+
+    def _handle_points(self) -> dict[str, QPointF]:
+        if self.rectangle is None:
+            return {}
+        corners = _rect_corners(self.rectangle)
+        center = np.array(self.rectangle[:2], dtype=np.float32)
+        theta = np.deg2rad(self.rectangle[4])
+        u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+        v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float32)
+        cx, cy, width, height, _ = self.rectangle
+        return {
+            "left": self._to_view((center - u * width / 2).tolist()),
+            "right": self._to_view((center + u * width / 2).tolist()),
+            "top": self._to_view((center - v * height / 2).tolist()),
+            "bottom": self._to_view((center + v * height / 2).tolist()),
+            "rotate": self._to_view((center - v * (height / 2 + 38 / max(self._image_view()[1], 1e-6))).tolist()),
+        }
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        super().paintEvent(event)
+        if self.rectangle is None or self._pixmap is None or self._pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(20, 220, 100), 2.5))
+        polygon = QPolygonF([self._to_view(point) for point in _rect_corners(self.rectangle)])
+        painter.drawPolygon(polygon)
+        center = self._to_view(self.rectangle[:2])
+        handles = self._handle_points()
+        painter.drawLine(polygon[0], handles["rotate"])
+        painter.setBrush(QColor(255, 255, 255))
+        for name in ("left", "right", "top", "bottom"):
+            painter.drawEllipse(handles[name], 6.0, 6.0)
+        painter.setBrush(QColor(255, 190, 30))
+        painter.drawEllipse(handles["rotate"], 7.0, 7.0)
+        painter.setBrush(QColor(20, 220, 100))
+        painter.drawEllipse(center, 4.0, 4.0)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if event.button() != Qt.MouseButton.LeftButton or self.rectangle is None:
+            return super().mousePressEvent(event)
+        point = event.position()
+        handles = self._handle_points()
+        for name, handle in handles.items():
+            if np.hypot(point.x() - handle.x(), point.y() - handle.y()) <= self.HANDLE_RADIUS:
+                self._drag = name
+                break
+        if self._drag is None:
+            polygon = QPolygonF([self._to_view(p) for p in _rect_corners(self.rectangle)])
+            if polygon.containsPoint(point, Qt.FillRule.OddEvenFill):
+                self._drag = "move"
+        if self._drag:
+            self._drag_start = self._to_image(point)
+            self._drag_rect = self.rectangle
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if not self._drag or self._drag_rect is None:
+            return super().mouseMoveEvent(event)
+        start, now = self._drag_start, self._to_image(event.position())
+        dx, dy = now - start
+        cx, cy, width, height, angle = self._drag_rect
+        theta = np.deg2rad(angle)
+        u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+        v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float32)
+        if self._drag == "move":
+            cx, cy = cx + float(dx), cy + float(dy)
+        elif self._drag == "rotate":
+            before = np.arctan2(start[1] - cy, start[0] - cx)
+            after = np.arctan2(now[1] - cy, now[0] - cx)
+            angle += float(np.degrees(after - before))
+        elif self._drag in ("left", "right"):
+            delta = float(np.dot(np.array([dx, dy]), u))
+            sign = -1.0 if self._drag == "left" else 1.0
+            width = max(24.0, width + sign * delta)
+            cx += float(u[0] * delta / 2)
+            cy += float(u[1] * delta / 2)
+        else:
+            delta = float(np.dot(np.array([dx, dy]), v))
+            sign = -1.0 if self._drag == "top" else 1.0
+            height = max(24.0, height + sign * delta)
+            cx += float(v[0] * delta / 2)
+            cy += float(v[1] * delta / 2)
+        self.rectangle = (cx, cy, width, height, angle)
+        self.update()
+        self.rectangle_changed.emit(self.rectangle)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        self._drag = None
+        self._drag_rect = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
 class ProcessWorker(QThread):
     item_done = Signal(str, object)
 
-    def __init__(self, paths: list[Path], output_dir: Path) -> None:
+    def __init__(self, paths: list[Path], output_dir: Path, *, crop_mode: str = "rectangle",
+                 manual_rect=None) -> None:
         super().__init__()
         self.paths = paths
         self.output_dir = output_dir
+        self.crop_mode = crop_mode
+        self.manual_rect = manual_rect
 
     def run(self) -> None:
         for path in self.paths:
-            result = process_image(path, self.output_dir)
+            result = process_image(path, self.output_dir, crop_mode=self.crop_mode,
+                                   manual_rect=self.manual_rect)
             self.item_done.emit(str(path), result)
 
 
@@ -148,22 +296,32 @@ class MainWindow(QMainWindow):
 
         previews = QWidget()
         preview_layout = QHBoxLayout(previews)
-        self.source_preview = Preview("원본 미리보기")
+        self.source_preview = CropEditor("원본 미리보기")
         self.result_preview = Preview("보정 결과 미리보기")
         preview_layout.addWidget(self._preview_column("원본", self.source_preview), 1)
         preview_layout.addWidget(self._preview_column("보정 결과", self.result_preview), 1)
         splitter.addWidget(previews)
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter, 1)
+        self.crop_help = QLabel(
+            "검출된 초록 사각형 안쪽을 드래그해 이동하고, 변 중간의 흰색 핸들로 크기를 조절하세요. "
+            "위쪽 주황색 핸들은 전체 회전입니다. 조정 후 ‘수동 사각형 적용’을 누르면 다시 크롭합니다."
+        )
+        self.crop_help.setWordWrap(True)
+        layout.addWidget(self.crop_help)
 
         actions = QHBoxLayout()
         self.process_selected_button = QPushButton("선택 항목 보정")
         self.process_all_button = QPushButton("전체 보정")
+        self.manual_apply_button = QPushButton("수동 사각형 적용")
+        self.perspective_mode = QCheckBox("고급 원근 보정")
         self.print_button = QPushButton("보정 결과 인쇄")
         self.open_diagnostics_button = QPushButton("단계별 진단 열기")
         self.open_output_button = QPushButton("결과 폴더 열기")
         actions.addWidget(self.process_selected_button)
         actions.addWidget(self.process_all_button)
+        actions.addWidget(self.manual_apply_button)
+        actions.addWidget(self.perspective_mode)
         actions.addStretch(1)
         actions.addWidget(self.print_button)
         actions.addWidget(self.open_diagnostics_button)
@@ -180,12 +338,15 @@ class MainWindow(QMainWindow):
         self.output_browse_button.clicked.connect(self.choose_output)
         self.process_selected_button.clicked.connect(self.process_selected)
         self.process_all_button.clicked.connect(self.process_all)
+        self.manual_apply_button.clicked.connect(self.apply_manual_rectangle)
+        self.source_preview.rectangle_changed.connect(self.update_live_crop_preview)
         self.file_list.currentItemChanged.connect(self.selection_changed)
         self.print_button.clicked.connect(self.print_selected)
         self.open_diagnostics_button.clicked.connect(self.open_diagnostics)
         self.open_output_button.clicked.connect(self.open_output)
         self.print_button.setEnabled(False)
         self.open_diagnostics_button.setEnabled(False)
+        self.manual_apply_button.setEnabled(False)
 
     @staticmethod
     def _preview_column(title: str, preview: Preview) -> QWidget:
@@ -254,11 +415,14 @@ class MainWindow(QMainWindow):
         if paths:
             self.start_processing(paths)
 
-    def start_processing(self, paths: list[Path]) -> None:
+    def start_processing(self, paths: list[Path], *, manual_rect=None) -> None:
         output_dir = Path(self.output_edit.text()).expanduser()
         self.set_busy(True)
         self.status.setText(f"{len(paths)}개 이미지를 처리하고 있습니다…")
-        self.worker = ProcessWorker(paths, output_dir)
+        mode = "perspective" if self.perspective_mode.isChecked() else "rectangle"
+        if len(paths) != 1 or self.perspective_mode.isChecked():
+            manual_rect = None
+        self.worker = ProcessWorker(paths, output_dir, crop_mode=mode, manual_rect=manual_rect)
         self.worker.item_done.connect(self.processing_done)
         self.worker.finished.connect(lambda: self.set_busy(False))
         self.worker.start()
@@ -289,22 +453,48 @@ class MainWindow(QMainWindow):
         if path:
             self.display_path(path)
         else:
-            self.source_preview.show_image(None)
+            self.source_preview.load_source(None)
             self.result_preview.show_image(None)
             self.print_button.setEnabled(False)
             self.open_diagnostics_button.setEnabled(False)
 
     def display_path(self, path: Path) -> None:
-        self.source_preview.show_image(path)
+        self.source_preview.load_source(path)
         result = self.results.get(str(path))
         if result:
             self.result_preview.show_image(result.output_path or result.preview_path)
+            self.source_preview.set_rectangle(result.rectangle)
             self.print_button.setEnabled(bool(result.output_path and result.output_path.is_file()))
             self.open_diagnostics_button.setEnabled(bool(result.debug_dir and result.debug_dir.is_dir()))
+            self.manual_apply_button.setEnabled(result.rectangle is not None)
         else:
             self.result_preview.show_image(None)
+            self.source_preview.set_rectangle(None)
             self.print_button.setEnabled(False)
             self.open_diagnostics_button.setEnabled(False)
+            self.manual_apply_button.setEnabled(False)
+
+    def apply_manual_rectangle(self) -> None:
+        path = self.selected_path()
+        rect = self.source_preview.rectangle
+        if not path or rect is None:
+            QMessageBox.information(self, "사각형 없음", "먼저 이미지를 자동 보정해 검출 사각형을 만든 뒤 조정하세요.")
+            return
+        self.perspective_mode.setChecked(False)
+        self.start_processing([path], manual_rect=rect)
+
+    def update_live_crop_preview(self, rect) -> None:
+        if self.source_preview._source is None or rect is None:
+            return
+        try:
+            card = _rectified_crop(self.source_preview._source, tuple(rect))
+            card = cv2.resize(card, (957, 602), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(card, cv2.COLOR_BGR2RGB)
+            height, width = rgb.shape[:2]
+            preview = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888)
+            self.result_preview.show_pixmap(QPixmap.fromImage(preview.copy()))
+        except (cv2.error, ValueError):
+            return
 
     def open_diagnostics(self) -> None:
         path = self.selected_path()
@@ -433,7 +623,8 @@ class MainWindow(QMainWindow):
 
     def set_busy(self, busy: bool) -> None:
         for button in (self.add_files_button, self.add_folder_button, self.remove_button,
-                       self.process_selected_button, self.process_all_button):
+                       self.process_selected_button, self.process_all_button,
+                       self.manual_apply_button, self.perspective_mode):
             button.setEnabled(not busy)
 
 
