@@ -363,6 +363,100 @@ def _candidate_contour(
                     **inset_details,
                     "component_mask": component,
                 }
+
+    # A shadowed or textured scan can make the LAB foreground mask join the
+    # card to the surrounding paper. In that case use the card's physical
+    # outline edges as a separate fallback instead of returning no candidate.
+    # Closing the Canny map joins the four long edges across rounded corners;
+    # polygon approximation then gives one shared four-corner outline.
+    if best is None:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        minimum_dimension = min(h, w)
+        close_sizes = sorted({
+            max(9, int(round(minimum_dimension * fraction)) | 1)
+            for fraction in (0.008, 0.010, 0.012)
+        })
+        edge_candidates: list[tuple[float, np.ndarray, dict]] = []
+        for low, high in ((8, 28), (12, 40), (18, 55)):
+            edges = cv2.Canny(gray, low, high)
+            for close_size in close_sizes:
+                close_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_RECT, (close_size, close_size),
+                )
+                closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
+                contours, _ = cv2.findContours(
+                    closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                )
+                for contour in contours:
+                    area = float(cv2.contourArea(contour))
+                    area_ratio = area / max(float(h * w), 1.0)
+                    if not 0.035 <= area_ratio <= 0.32:
+                        continue
+                    x, y, box_w, box_h = cv2.boundingRect(contour)
+                    margin = max(2, int(minimum_dimension * 0.008))
+                    if x <= margin or y <= margin or x + box_w >= w - margin or y + box_h >= h - margin:
+                        continue
+
+                    hull = cv2.convexHull(contour)
+                    perimeter = cv2.arcLength(hull, True)
+                    if perimeter < 4:
+                        continue
+                    quad = None
+                    for epsilon in (0.008, 0.012, 0.016, 0.022, 0.030, 0.040):
+                        approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
+                        if len(approx) == 4 and cv2.isContourConvex(approx):
+                            candidate_quad = _order_points(approx.reshape(4, 2))
+                            lengths = [float(np.linalg.norm(
+                                candidate_quad[(i + 1) % 4] - candidate_quad[i]
+                            )) for i in range(4)]
+                            ratio = max(lengths) / max(min(lengths), 1.0)
+                            if 1.35 <= ratio <= 2.05:
+                                quad = candidate_quad
+                                break
+                    if quad is None:
+                        continue
+
+                    # Prefer a plausible ID aspect and a compact outline. The
+                    # edge map often contains shadows, so contour area alone
+                    # must not reward the largest closed region.
+                    lengths = [float(np.linalg.norm(quad[(i + 1) % 4] - quad[i]))
+                               for i in range(4)]
+                    ratio = max(np.mean(lengths[0::2]), np.mean(lengths[1::2])) / max(
+                        min(np.mean(lengths[0::2]), np.mean(lengths[1::2])), 1.0,
+                    )
+                    quad_area_ratio = abs(float(cv2.contourArea(quad.reshape(-1, 1, 2)))) / (h * w)
+                    if not 0.035 <= quad_area_ratio <= 0.32:
+                        continue
+                    ratio_score = max(0.0, 1.0 - abs(ratio - 1.59) / 0.55)
+                    area_score = max(0.0, 1.0 - abs(quad_area_ratio - 0.16) / 0.20)
+                    score = 0.60 * ratio_score + 0.40 * area_score
+                    edge_candidates.append((score, quad, {
+                        "fit_mode": "canny_edge_quad",
+                        "edge_detector": {"canny_low": low, "canny_high": high,
+                                          "close_kernel_px": close_size},
+                        "component_area_px": int(area),
+                        "component_fill_ratio": float(area / max(
+                            abs(float(cv2.contourArea(quad.reshape(-1, 1, 2)))), 1.0,
+                        )),
+                        "selected_threshold_lab": None,
+                    }))
+
+        if edge_candidates:
+            score, quad, details = max(edge_candidates, key=lambda item: item[0])
+            # Keep a small, equal inset on all sides so rounded card corners
+            # and the outermost antialiasing/shadow pixels do not enter print.
+            lengths = [float(np.linalg.norm(quad[(i + 1) % 4] - quad[i]))
+                       for i in range(4)]
+            inset = max(1.0, min(min(lengths) * 0.012, 18.0))
+            inner_quad = _inset_quad_uniform(quad, inset)
+            best = (inner_quad, float(min(0.82, 0.50 + score * 0.30)))
+            best_details = {
+                "outer_corners_xy": quad.tolist(),
+                "inner_corners_xy": inner_quad.tolist(),
+                **details,
+                "edge_shared_inset_px": inset,
+            }
     if debug is not None:
         debug["thresholds_tried_lab"] = thresholds_tried
         if best_details:
