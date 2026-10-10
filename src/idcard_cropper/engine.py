@@ -46,6 +46,64 @@ def _order_points(points: np.ndarray) -> np.ndarray:
     )  # top-left, top-right, bottom-right, bottom-left
 
 
+def _fit_quad_edges(contour: np.ndarray, seed: np.ndarray) -> tuple[np.ndarray | None, dict]:
+    """Fit each long card edge and intersect the four lines for stable corners."""
+    points = contour.reshape(-1, 2).astype(np.float32)
+    seed = _order_points(seed)
+    side_lengths = [float(np.linalg.norm(seed[(i + 1) % 4] - seed[i])) for i in range(4)]
+    band = max(24.0, min(min(side_lengths) * 0.07, 80.0))
+    fitted_lines: list[tuple[np.ndarray, float]] = []
+    residuals: list[float] = []
+
+    for index in range(4):
+        start, end = seed[index], seed[(index + 1) % 4]
+        vector = end - start
+        length = float(np.linalg.norm(vector))
+        if length < 2:
+            return None, {}
+        axis = vector / length
+        normal = np.array([-axis[1], axis[0]], dtype=np.float32)
+        relative = points - start
+        along = relative @ axis
+        across = relative @ normal
+        selected = points[(along > length * 0.12) & (along < length * 0.88)
+                          & (np.abs(across) < band)]
+        if len(selected) < 30:
+            return None, {}
+
+        vx, vy, _, _ = cv2.fitLine(
+            selected.reshape(-1, 1, 2), cv2.DIST_HUBER, 0, 0.01, 0.01,
+        ).reshape(-1)
+        direction = np.array([vx, vy], dtype=np.float32)
+        direction /= max(float(np.linalg.norm(direction)), 1e-6)
+        line_normal = np.array([-direction[1], direction[0]], dtype=np.float32)
+        offset = float(np.median(selected @ line_normal))
+        error = np.abs(selected @ line_normal - offset)
+        p90 = float(np.percentile(error, 90))
+        if p90 > band * 0.65:
+            return None, {}
+        fitted_lines.append((line_normal, offset))
+        residuals.append(p90)
+
+    corners = []
+    for index in range(4):
+        previous_normal, previous_offset = fitted_lines[(index - 1) % 4]
+        next_normal, next_offset = fitted_lines[index]
+        matrix = np.stack((previous_normal, next_normal))
+        if abs(float(np.linalg.det(matrix))) < 0.15:
+            return None, {}
+        point = np.linalg.solve(matrix, np.array([previous_offset, next_offset]))
+        corners.append(point)
+    fitted = np.asarray(corners, dtype=np.float32)
+    if not cv2.isContourConvex(fitted.reshape(-1, 1, 2)):
+        return None, {}
+    max_shift = max(float(np.linalg.norm(a - b)) for a, b in zip(seed, fitted))
+    if max_shift > min(side_lengths) * 0.12:
+        return None, {}
+    return fitted, {"edge_fit_p90_residual_px": residuals,
+                    "edge_fit_max_corner_shift_px": max_shift}
+
+
 def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
     """Return true when a scan is a rotated rectangle with negligible perspective."""
     tl, tr, br, bl = quad
@@ -61,12 +119,11 @@ def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
 
     width_delta = abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1])
     height_delta = abs(lengths[2] - lengths[3]) / max(lengths[2], lengths[3])
-    # Scanner/near-flatbed input can have a few pixels of contour noise at
-    # rounded corners. Treat that as a rotated rectangle instead of preserving
-    # a noisy trapezoid in the optional perspective mode.
-    return (max(width_delta, height_delta) <= 0.08
-            and direction_delta(edges[0], edges[1]) <= 6.5
-            and direction_delta(edges[2], edges[3]) <= 6.5)
+    # Fit lines ignore rounded corners. Only suppress perspective correction
+    # when opposite edges are actually close to parallel and equal in length.
+    return (max(width_delta, height_delta) <= 0.06
+            and direction_delta(edges[0], edges[1]) <= 2.5
+            and direction_delta(edges[2], edges[3]) <= 2.5)
 
 
 def _move_corners_inside_component(
@@ -124,6 +181,26 @@ def _move_corners_inside_component(
         for corner, (axis_a, axis_b) in zip(quad, inward_axes)
     ], dtype=np.float32)
     return adjusted
+
+
+def _inset_quad_uniform(quad: np.ndarray, inset: float) -> np.ndarray:
+    """Move each quad corner inward by the same distance along both edges."""
+    tl, tr, br, bl = quad
+
+    def unit(vector: np.ndarray) -> np.ndarray:
+        length = float(np.linalg.norm(vector))
+        return vector / length if length > 0 else vector
+
+    axes = (
+        (unit(tr - tl), unit(bl - tl)),
+        (unit(tl - tr), unit(br - tr)),
+        (unit(tr - br), unit(bl - br)),
+        (unit(br - bl), unit(tl - bl)),
+    )
+    return np.asarray([
+        corner + inset * (axis_a + axis_b)
+        for corner, (axis_a, axis_b) in zip(quad, axes)
+    ], dtype=np.float32)
 
 
 def _deskew_scan(image: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -197,6 +274,7 @@ def _candidate_contour(
             hull = cv2.convexHull(contour)
             quad = None
             fitted_rect = None
+            edge_fit_details: dict = {}
             fit_mode = "rotated_rectangle" if force_rectangle else "contour_quad"
             if force_rectangle:
                 # Flatbed scans need rotation only. Fit this component's whole
@@ -231,8 +309,12 @@ def _candidate_contour(
                         ratio = max(np.mean(widths), np.mean(heights)) / max(1.0, min(np.mean(widths), np.mean(heights)))
                         box_area_ratio = float(np.mean(widths) * np.mean(heights) / (h * w))
                         if 1.35 <= ratio <= 2.05 and box_area_ratio <= 0.35:
-                            # Keep perspective correction available for genuine
-                            # camera skew in the optional advanced mode.
+                            fitted_quad, edge_fit_details = _fit_quad_edges(contour, ordered)
+                            if fitted_quad is not None:
+                                ordered = fitted_quad
+                                fit_mode = "fitted_edge_quad"
+                            # Flatbed scans have parallel edges; genuine
+                            # camera skew keeps the four fitted edge lines.
                             if _is_nearly_parallel_card(ordered):
                                 ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
                                 fit_mode = "minimum_area_rectangle"
@@ -277,6 +359,7 @@ def _candidate_contour(
                     "component_fill_ratio": float(fill),
                     "fit_mode": fit_mode,
                     "initial_rotated_rect": fitted_rect,
+                    **edge_fit_details,
                     **inset_details,
                     "component_mask": component,
                 }
@@ -625,11 +708,12 @@ def process_image(
                          outer_corners_xy=corners.tolist(), inner_corners_xy=corners.tolist())
     else:
         corners, confidence = _candidate_contour(
-            image, detection, force_rectangle=(crop_mode == "rectangle"),
+            image, detection, force_rectangle=False,
         )
         rect = None
     component_mask = detection.pop("component_mask", None)
-    if crop_mode == "rectangle" and corners is not None and manual_rect is None:
+    if (crop_mode == "rectangle" and corners is not None and manual_rect is None
+            and detection.get("fit_mode") in {"rotated_rectangle", "minimum_area_rectangle"}):
         outer_corners = np.asarray(detection.get("outer_corners_xy", corners), dtype=np.float32)
         initial_rect = detection.get("initial_rotated_rect") or _rect_from_corners(outer_corners)
         if component_mask is not None:
@@ -658,11 +742,9 @@ def process_image(
         }
         detection["rounded_corner_inset"] = corner_details
         detection["inner_corners_xy"] = corners.tolist()
-    elif (crop_mode == "perspective" and corners is not None
-          and detection.get("fit_mode") == "minimum_area_rectangle"
+    elif (corners is not None and detection.get("fit_mode") == "minimum_area_rectangle"
           and manual_rect is None):
-        # If the four detected edges are nearly parallel, advanced mode should
-        # not retain their small contour-induced trapezoid. Refine one shared
+        # If the four detected edges are genuinely parallel, refine one shared
         # rotated rectangle against the card mask, then inset all sides evenly.
         initial_rect = detection.get("initial_rotated_rect") or _rect_from_corners(corners)
         rect = _refine_rotated_rect(component_mask, tuple(initial_rect), detection) \
@@ -684,6 +766,26 @@ def process_image(
         }
         detection["rounded_corner_inset"] = corner_details
         detection["inner_corners_xy"] = corners.tolist()
+    elif (corners is not None and detection.get("fit_mode") == "fitted_edge_quad"
+          and manual_rect is None):
+        # Perspective skew is measured from the four fitted physical edges.
+        # Keep the quad slightly inside rounded corners, then rectify it to a
+        # true rectangle during the perspective warp.
+        outer_quad = corners.copy()
+        corner_details: dict = {}
+        inner_quad = (_move_corners_inside_component(
+            component_mask, outer_quad, corner_details,
+        ) if component_mask is not None else None)
+        if inner_quad is None:
+            edge_lengths = [float(np.linalg.norm(outer_quad[(i + 1) % 4] - outer_quad[i]))
+                            for i in range(4)]
+            inset = max(1.0, min(min(edge_lengths) * 0.02, 24.0))
+            inner_quad = _inset_quad_uniform(outer_quad, inset)
+            corner_details["shared_inset_px"] = inset
+        corners = inner_quad
+        detection["outer_corners_xy"] = outer_quad.tolist()
+        detection["inner_corners_xy"] = corners.tolist()
+        detection["rounded_corner_inset"] = corner_details
     info["detection"] = {key: value for key, value in detection.items()}
     info["detection_confidence"] = confidence
     if "outer_corners_xy" in detection:
