@@ -11,11 +11,15 @@ import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings, QPointF
 from PySide6.QtGui import (QDesktopServices, QImage, QPageLayout, QPageSize, QPainter,
                            QPixmap, QPen, QColor, QPolygonF)
-from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -519,28 +523,46 @@ class MainWindow(QMainWindow):
             )
             return
 
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         preferred_name = _preferred_printer_name()
-        if preferred_name:
-            printer.setPrinterName(preferred_name)
-        # Select the printer first, then seed its own C form and landscape
-        # layout before the dialog is shown so users do not have to set them.
-        _set_c_landscape_default(printer)
-        printer.setDocName(result.output_path.stem)
-        dialog = QPrintDialog(printer, self)
-        dialog.setWindowTitle("SELPHY 프린터와 용지 설정")
-        if dialog.exec() != QPrintDialog.DialogCode.Accepted:
+        # Qt's native Windows print dialog reloads the driver's saved DEVMODE
+        # and ignores the page layout seeded on QPrinter. It then shows
+        # portrait even though the job is changed back to landscape below.
+        # Use an app-owned confirmation dialog so the required C/landscape
+        # settings are explicit and applied consistently on every print.
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SELPHY 인쇄 설정")
+        form = QFormLayout(dialog)
+        printer_combo = QComboBox(dialog)
+        printer_combo.addItems(available)
+        if preferred_name in available:
+            printer_combo.setCurrentText(preferred_name)
+        form.addRow("프린터", printer_combo)
+        form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
+        form.addRow("방향", QLabel("가로"))
+        form.addRow("인쇄 크기", QLabel("8.1 × 5.1 cm · 300 DPI"))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Print | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
+        selected_printer = printer_combo.currentText()
         settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
-        settings.setValue("printing/last_printer", printer.printerName())
+        settings.setValue("printing/last_printer", selected_printer)
         settings.sync()
-        # Keep the required paper and orientation on the submitted job even if
-        # the native dialog switched them while changing printer.
+
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPrinterName(selected_printer)
         _set_c_landscape_default(printer)
+        printer.setDocName(result.output_path.stem)
 
         # Print the 81 x 51 mm card at its physical size, centered on the
-        # printer's selected paper. Users choose SELPHY/card media in its driver.
+        # selected C-size page. The selected media/orientation are deliberately
+        # reapplied for every job because Canon driver preferences are per-PC.
         printer.setFullPage(True)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         px_per_mm = printer.resolution() / 25.4
@@ -596,6 +618,7 @@ class MainWindow(QMainWindow):
             "target_rect_px": [target.x(), target.y(), target.width(), target.height()],
             "printer_resolution_dpi": printer.resolution(),
             "page_size_mm": [86.0, 54.0],
+            "media": "C card (54 x 86 mm)",
             "orientation": "landscape",
             "card_size_mm": [81.0, 51.0],
         })
