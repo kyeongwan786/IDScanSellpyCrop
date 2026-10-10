@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF
+from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings
 from PySide6.QtGui import QDesktopServices, QImage, QPageLayout, QPageSize, QPainter, QPixmap
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
@@ -30,6 +31,43 @@ from .engine import CropResult, process_image
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 USER_ROLE = int(Qt.ItemDataRole.UserRole)
+SETTINGS_ORGANIZATION = "IDCardCropper"
+SETTINGS_APPLICATION = "IDCardCropper"
+
+
+def _preferred_printer_name() -> str:
+    names = QPrinterInfo.availablePrinterNames()
+    settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+    saved = str(settings.value("printing/last_printer", ""))
+    if saved in names:
+        return saved
+    selphy = ""
+    for name in names:
+        info = QPrinterInfo.printerInfo(name)
+        identity = f"{name} {info.description()} {info.makeAndModel()}".casefold()
+        if "selphy" in identity:
+            selphy = name
+            break
+    if selphy:
+        return selphy
+    default = QPrinterInfo.defaultPrinterName()
+    return default if default in names else (names[0] if names else "")
+
+
+def _c_size_for_printer(printer: QPrinter) -> QPageSize:
+    info = QPrinterInfo(printer)
+    for supported_size in info.supportedPageSizes():
+        size = supported_size.size(QPageSize.Unit.Millimeter)
+        if abs(max(size.width(), size.height()) - 86.0) <= 0.5 and abs(
+            min(size.width(), size.height()) - 54.0
+        ) <= 0.5:
+            return supported_size
+    return QPageSize(QSizeF(86.0, 54.0), QPageSize.Unit.Millimeter, "C Size")
+
+
+def _set_c_landscape_default(printer: QPrinter) -> None:
+    printer.setPageSize(_c_size_for_printer(printer))
+    printer.setPageOrientation(QPageLayout.Orientation.Landscape)
 
 
 class Preview(QLabel):
@@ -283,28 +321,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "인쇄할 결과 없음", "먼저 이미지를 보정하세요.")
             return
 
+        available = QPrinterInfo.availablePrinterNames()
+        if not available:
+            QMessageBox.critical(
+                self, "프린터를 찾을 수 없음",
+                "Windows에 설치된 프린터가 없습니다. SELPHY 드라이버를 설치하고 연결 상태를 확인하세요.",
+            )
+            return
+
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        # Canon SELPHY C Size stock is 86 x 54 mm; default to landscape C media.
-        c_size = QPageSize(QSizeF(86.0, 54.0), QPageSize.Unit.Millimeter, "C Size")
-        printer.setPageSize(c_size)
-        printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+        preferred_name = _preferred_printer_name()
+        if preferred_name:
+            printer.setPrinterName(preferred_name)
+        # Select the printer first, then seed its own C form and landscape
+        # layout before the dialog is shown so users do not have to set them.
+        _set_c_landscape_default(printer)
         printer.setDocName(result.output_path.stem)
         dialog = QPrintDialog(printer, self)
         dialog.setWindowTitle("SELPHY 프린터와 용지 설정")
         if dialog.exec() != QPrintDialog.DialogCode.Accepted:
             return
 
-        # Prefer the printer driver's own C Size form when it exposes one.
-        printer_info = QPrinterInfo(printer.printerName())
-        for supported_size in printer_info.supportedPageSizes():
-            size = supported_size.size(QPageSize.Unit.Millimeter)
-            if abs(max(size.width(), size.height()) - 86.0) <= 0.5 and abs(
-                min(size.width(), size.height()) - 54.0
-            ) <= 0.5:
-                c_size = supported_size
-                break
-        printer.setPageSize(c_size)
-        printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+        settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+        settings.setValue("printing/last_printer", printer.printerName())
+        settings.sync()
+        # Keep the required paper and orientation on the submitted job even if
+        # the native dialog switched them while changing printer.
+        _set_c_landscape_default(printer)
 
         # Print the 81 x 51 mm card at its physical size, centered on the
         # printer's selected paper. Users choose SELPHY/card media in its driver.
@@ -314,6 +357,13 @@ class MainWindow(QMainWindow):
         card_w = 81.0 * px_per_mm
         card_h = 51.0 * px_per_mm
         if page.width() < card_w or page.height() < card_h:
+            self._write_print_log(result, {
+                "status": "rejected_page_too_small",
+                "printer_name": printer.printerName(),
+                "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
+                "printer_resolution_dpi": printer.resolution(),
+                "required_card_mm": [81.0, 51.0],
+            })
             QMessageBox.warning(
                 self, "용지 크기 확인",
                 "선택한 용지가 8.1 × 5.1cm 인쇄 영역보다 작습니다.\n"
@@ -323,6 +373,10 @@ class MainWindow(QMainWindow):
 
         image = QImage(str(result.output_path))
         if image.isNull():
+            self._write_print_log(result, {
+                "status": "failed_to_load_image",
+                "printer_name": printer.printerName(),
+            })
             QMessageBox.critical(self, "인쇄 오류", "보정 이미지를 열 수 없습니다.")
             return
         target = QRectF(page.x() + (page.width() - card_w) / 2,
@@ -330,12 +384,47 @@ class MainWindow(QMainWindow):
                         card_w, card_h)
         painter = QPainter()
         if not painter.begin(printer):
+            state = printer.printerState()
+            self._write_print_log(result, {
+                "status": "painter_begin_failed",
+                "printer_name": printer.printerName(),
+                "printer_state": state.name,
+            })
             QMessageBox.critical(self, "인쇄 오류", "프린터 작업을 시작하지 못했습니다.")
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.drawImage(target, image)
-        painter.end()
+        ended = painter.end()
+        state = printer.printerState()
+        succeeded = ended and state != QPrinter.PrinterState.Aborted
+        self._write_print_log(result, {
+            "status": "sent_to_spooler" if succeeded else "print_job_failed",
+            "printer_name": printer.printerName(),
+            "printer_state": state.name,
+            "painter_end": ended,
+            "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
+            "target_rect_px": [target.x(), target.y(), target.width(), target.height()],
+            "printer_resolution_dpi": printer.resolution(),
+            "page_size_mm": [86.0, 54.0],
+            "orientation": "landscape",
+            "card_size_mm": [81.0, 51.0],
+        })
+        if not succeeded:
+            QMessageBox.critical(
+                self, "인쇄 오류",
+                f"인쇄 작업 전송에 실패했습니다. 프린터 상태: {state.name}\n"
+                "단계별 진단 폴더의 print_attempt.json을 확인하세요.",
+            )
+            return
         self.status.setText("인쇄 작업을 프린터로 보냈습니다. 프린터 드라이버에서 카드 용지와 테두리 설정을 확인하세요.")
+
+    @staticmethod
+    def _write_print_log(result: CropResult, info: dict) -> None:
+        folder = result.debug_dir or (result.output_path.parent if result.output_path else Path.cwd())
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "print_attempt.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
 
     def open_output(self) -> None:
         folder = Path(self.output_edit.text()).expanduser()
