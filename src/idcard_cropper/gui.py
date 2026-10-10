@@ -248,7 +248,7 @@ class CropEditor(Preview):
 class ProcessWorker(QThread):
     item_done = Signal(str, object)
 
-    def __init__(self, paths: list[Path], output_dir: Path, *, crop_mode: str = "rectangle",
+    def __init__(self, paths: list[Path], output_dir: Path, *, crop_mode: str = "perspective",
                  manual_rect=None) -> None:
         super().__init__()
         self.paths = paths
@@ -318,7 +318,8 @@ class MainWindow(QMainWindow):
         self.process_selected_button = QPushButton("선택 항목 보정")
         self.process_all_button = QPushButton("전체 보정")
         self.manual_apply_button = QPushButton("수동 사각형 적용")
-        self.perspective_mode = QCheckBox("고급 원근 보정")
+        self.perspective_mode = QCheckBox("원근 보정 (카메라 사진)")
+        self.perspective_mode.setChecked(True)
         self.print_button = QPushButton("보정 결과 인쇄")
         self.open_diagnostics_button = QPushButton("단계별 진단 열기")
         self.open_output_button = QPushButton("결과 폴더 열기")

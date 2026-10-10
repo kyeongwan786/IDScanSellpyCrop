@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import shutil
 import sys
@@ -44,6 +45,151 @@ def _order_points(points: np.ndarray) -> np.ndarray:
         [points[np.argmin(sums)], points[np.argmin(diffs)],
          points[np.argmax(sums)], points[np.argmax(diffs)]], dtype=np.float32
     )  # top-left, top-right, bottom-right, bottom-left
+
+
+def _sort_quad(points: np.ndarray) -> np.ndarray:
+    """Order four points cyclically, including cards rotated near 45 degrees."""
+    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
+    center = points.mean(axis=0)
+    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
+    ordered = points[np.argsort(angles)]
+    return np.roll(ordered, -int(np.argmin(ordered.sum(axis=1))), axis=0)
+
+
+def _fullauto_masks(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """Build distinct foreground/edge masks for photographed card boundaries."""
+    height, width = image.shape[:2]
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    border_width = max(2, width // 35)
+    border_height = max(2, height // 35)
+    border = np.concatenate((
+        blurred[:border_height].reshape(-1, 3),
+        blurred[-border_height:].reshape(-1, 3),
+        blurred[:, :border_width].reshape(-1, 3),
+        blurred[:, -border_width:].reshape(-1, 3),
+    ))
+    background = np.median(border.astype(np.float32), axis=0)
+    difference = np.max(np.abs(blurred.astype(np.float32) - background), axis=2)
+    masks: list[tuple[str, np.ndarray]] = [
+        (f"background_{threshold}", np.uint8(difference > threshold) * 255)
+        for threshold in (17, 28, 42)
+    ]
+    for threshold in (120, 150, 180, 210):
+        masks.append((f"bright_{threshold}", np.uint8(gray > threshold) * 255))
+        masks.append((f"dark_{threshold}", np.uint8(gray < threshold) * 255))
+    masks.append(("edges", cv2.Canny(gray, 35, 110)))
+
+    kernel_size = max(5, int(min(height, width) * 0.018) // 2 * 2 + 1)
+    ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    edge_size = max(5, kernel_size // 2 * 2 + 1)
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_size, edge_size))
+    return [
+        (name, cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                edge_kernel if name == "edges" else ellipse))
+        for name, mask in masks
+    ]
+
+
+def _quad_border_contrast(gray: np.ndarray, points: np.ndarray) -> float:
+    """Measure the grayscale jump across the four proposed card edges."""
+    points = _sort_quad(points)
+    center = points.mean(axis=0)
+    height, width = gray.shape[:2]
+    delta = max(3.0, min(height, width) * 0.008)
+    edge_values: list[float] = []
+    for start, end in zip(points, np.roll(points, -1, axis=0)):
+        vector = end - start
+        if float(np.linalg.norm(vector)) < 20:
+            continue
+        midpoint = (start + end) / 2
+        inward = center - midpoint
+        inward /= max(float(np.linalg.norm(inward)), 1.0)
+        samples: list[float] = []
+        for fraction in np.linspace(0.12, 0.88, 13):
+            point = start * (1.0 - fraction) + end * fraction
+            inside = np.rint(point + inward * delta).astype(int)
+            outside = np.rint(point - inward * delta).astype(int)
+            if (0 <= inside[0] < width and 0 <= inside[1] < height
+                    and 0 <= outside[0] < width and 0 <= outside[1] < height):
+                samples.append(abs(int(gray[inside[1], inside[0]])
+                                   - int(gray[outside[1], outside[0]])))
+        if samples:
+            edge_values.append(float(np.median(samples)))
+    return float(np.mean(edge_values)) if edge_values else 0.0
+
+
+def _detect_fullauto_quad(image: np.ndarray) -> tuple[np.ndarray, float, dict] | None:
+    """Find four card corners from the full-auto camera-photo detector masks."""
+    image_height, image_width = image.shape[:2]
+    scale = min(1.0, 1500.0 / max(image_height, image_width))
+    work = (cv2.resize(image, (round(image_width * scale), round(image_height * scale)),
+                       interpolation=cv2.INTER_AREA) if scale < 1.0 else image)
+    height, width = work.shape[:2]
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+    target_ratio = 8.1 / 5.1
+    candidates: list[tuple[float, np.ndarray, dict]] = []
+
+    for mask_name, mask in _fullauto_masks(work):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:25]:
+            area = float(cv2.contourArea(contour))
+            area_fraction = area / max(float(width * height), 1.0)
+            if not 0.025 <= area_fraction <= 0.80:
+                continue
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            margin = max(3, int(min(height, width) * 0.006))
+            if (x <= margin or y <= margin or x + box_width >= width - margin
+                    or y + box_height >= height - margin):
+                continue
+
+            rectangle = cv2.minAreaRect(contour)
+            rect_width, rect_height = rectangle[1]
+            if min(rect_width, rect_height) < 25:
+                continue
+            ratio = max(rect_width, rect_height) / min(rect_width, rect_height)
+            fill = area / (rect_width * rect_height)
+            if not 1.35 <= ratio <= 1.90 or not 0.57 <= fill <= 1.13:
+                continue
+
+            quad = cv2.boxPoints(rectangle)
+            method = "rotated_rectangle"
+            perimeter = cv2.arcLength(contour, True)
+            approximation = cv2.approxPolyDP(contour, 0.027 * perimeter, True)
+            if len(approximation) == 4 and cv2.isContourConvex(approximation):
+                measured = _sort_quad(approximation.reshape(4, 2))
+                side_lengths = np.linalg.norm(np.roll(measured, -1, axis=0) - measured, axis=1)
+                measured_ratio = max(side_lengths) / max(float(min(side_lengths)), 1.0)
+                polygon_area = cv2.contourArea(measured)
+                if 1.35 <= measured_ratio <= 1.90 and polygon_area >= 0.72 * rect_width * rect_height:
+                    quad, method = measured, "four_corners"
+            quad = _sort_quad(quad)
+            contrast = _quad_border_contrast(gray, quad)
+            score = (
+                65.0 - 120.0 * abs(math.log(ratio / target_ratio))
+                + 55.0 * min(fill, 1.0)
+                + min(40.0, contrast) * 1.1
+                + min(area_fraction, 0.22) * 65.0
+                + (7.0 if method == "four_corners" else 0.0)
+            )
+            candidates.append((score, quad, {
+                "fit_mode": f"fullauto_{method}",
+                "detector_mask": mask_name,
+                "detector_fill_ratio": float(fill),
+                "detector_border_contrast": float(contrast),
+                "detector_area_fraction": float(area_fraction),
+                "detector_score": float(score),
+            }))
+
+    if not candidates:
+        return None
+    score, points, details = max(candidates, key=lambda candidate: candidate[0])
+    contrast = details["detector_border_contrast"]
+    if score < 105 or contrast < 10:
+        return None
+    points = points / scale
+    confidence = float(min(0.96, 0.55 + (score - 105.0) * 0.006))
+    return points, confidence, {"outer_corners_xy": points.tolist(), **details}
 
 
 def _fit_quad_edges(contour: np.ndarray, seed: np.ndarray) -> tuple[np.ndarray | None, dict]:
@@ -832,7 +978,7 @@ def process_image(
     input_path: str | Path,
     output_dir: str | Path,
     *,
-    crop_mode: str = "rectangle",
+    crop_mode: str = "perspective",
     manual_rect: tuple[float, float, float, float, float] | None = None,
 ) -> CropResult:
     """Process one JPG/PNG. Uncertain detection or orientation never saves a final image."""
@@ -871,9 +1017,22 @@ def process_image(
                                                "angle_degrees": rect[4]},
                          outer_corners_xy=corners.tolist(), inner_corners_xy=corners.tolist())
     else:
-        corners, confidence = _candidate_contour(
-            image, detection, force_rectangle=False,
-        )
+        fullauto = (_detect_fullauto_quad(image) if crop_mode == "perspective" else None)
+        if fullauto is not None:
+            outer_quad, confidence, detector_details = fullauto
+            center = outer_quad.mean(axis=0)
+            corners = outer_quad + (center - outer_quad) * 0.016
+            detection.update(
+                detector_details,
+                crop_mode="perspective",
+                outer_corners_xy=outer_quad.tolist(),
+                inner_corners_xy=corners.tolist(),
+                perspective_inset_fraction=0.016,
+            )
+        else:
+            corners, confidence = _candidate_contour(
+                image, detection, force_rectangle=False,
+            )
         rect = None
     component_mask = detection.pop("component_mask", None)
     if (crop_mode == "rectangle" and corners is not None and manual_rect is None
