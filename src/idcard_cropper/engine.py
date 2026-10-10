@@ -61,9 +61,12 @@ def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
 
     width_delta = abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1])
     height_delta = abs(lengths[2] - lengths[3]) / max(lengths[2], lengths[3])
-    return (max(width_delta, height_delta) <= 0.04
-            and direction_delta(edges[0], edges[1]) <= 3.0
-            and direction_delta(edges[2], edges[3]) <= 3.0)
+    # Scanner/near-flatbed input can have a few pixels of contour noise at
+    # rounded corners. Treat that as a rotated rectangle instead of preserving
+    # a noisy trapezoid in the optional perspective mode.
+    return (max(width_delta, height_delta) <= 0.08
+            and direction_delta(edges[0], edges[1]) <= 6.5
+            and direction_delta(edges[2], edges[3]) <= 6.5)
 
 
 def _move_corners_inside_component(
@@ -233,6 +236,7 @@ def _candidate_contour(
                             if _is_nearly_parallel_card(ordered):
                                 ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
                                 fit_mode = "minimum_area_rectangle"
+                                fitted_rect = _rect_from_corners(ordered)
                             quad = ordered
                             break
             if quad is None:
@@ -243,6 +247,19 @@ def _candidate_contour(
             inner_quad = quad.copy() if force_rectangle else _move_corners_inside_component(
                 component, quad, inset_details,
             )
+            if inner_quad is None and fit_mode == "minimum_area_rectangle":
+                # Rounded card corners can leave the ideal rectangular corner
+                # just outside the threshold mask. Keep the fitted rectangle
+                # and inset all four sides by the same amount.
+                fitted_rect = _rect_from_corners(quad)
+                inset = max(1.0, min(fitted_rect[3] * 0.025, 30.0))
+                inner_quad = _rect_corners((
+                    fitted_rect[0], fitted_rect[1],
+                    fitted_rect[2] - 2 * inset,
+                    fitted_rect[3] - 2 * inset,
+                    fitted_rect[4],
+                ))
+                inset_details["shared_inset_px"] = inset
             if inner_quad is None:
                 continue
 
@@ -631,7 +648,33 @@ def process_image(
         if inset <= 0:
             # Threshold masks can miss a very pale card corner; keep a modest
             # deterministic safety inset rather than risk a paper sliver.
-            inset = max(1.0, min(rect[3] * 0.012, 12.0))
+            inset = max(1.0, min(rect[3] * 0.025, 30.0))
+        rect = (rect[0], rect[1], max(2.0, rect[2] - 2 * inset),
+                max(2.0, rect[3] - 2 * inset), rect[4])
+        corners = _rect_corners(rect)
+        detection["rectangle_parameters"] = {
+            "center_x": rect[0], "center_y": rect[1], "width": rect[2],
+            "height": rect[3], "angle_degrees": rect[4], "inset_px_per_side": inset,
+        }
+        detection["rounded_corner_inset"] = corner_details
+        detection["inner_corners_xy"] = corners.tolist()
+    elif (crop_mode == "perspective" and corners is not None
+          and detection.get("fit_mode") == "minimum_area_rectangle"
+          and manual_rect is None):
+        # If the four detected edges are nearly parallel, advanced mode should
+        # not retain their small contour-induced trapezoid. Refine one shared
+        # rotated rectangle against the card mask, then inset all sides evenly.
+        initial_rect = detection.get("initial_rotated_rect") or _rect_from_corners(corners)
+        rect = _refine_rotated_rect(component_mask, tuple(initial_rect), detection) \
+            if component_mask is not None else tuple(initial_rect)
+        corner_details: dict = {}
+        if component_mask is not None:
+            _move_corners_inside_component(
+                component_mask, _rect_corners(rect), corner_details,
+            )
+        inset = float(corner_details.get("shared_inset_px", 0.0))
+        if inset <= 0:
+            inset = max(1.0, min(rect[3] * 0.025, 30.0))
         rect = (rect[0], rect[1], max(2.0, rect[2] - 2 * inset),
                 max(2.0, rect[3] - 2 * inset), rect[4])
         corners = _rect_corners(rect)
