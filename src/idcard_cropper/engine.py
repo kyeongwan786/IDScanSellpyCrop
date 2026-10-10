@@ -329,8 +329,8 @@ def _refine_rotated_rect(
         work, current = mask, rect
     _, labels = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY)
     current_score = _rect_mask_score(labels, current)
-    # Search each parameter independently from coarse to fine. The mask supplies
-    # the observed card boundary; the fitted model remains a true rectangle.
+    # Optimize the five rectangle parameters, rather than moving individual
+    # corners. The model guarantees right angles and parallel opposite sides.
     base = max(current[2], current[3])
     steps = [max(1.0, base * 0.012), max(0.5, base * 0.003), max(0.25, base * 0.0008)]
     angle_steps = [0.5, 0.12, 0.03]
@@ -616,9 +616,19 @@ def process_image(
             rect = _refine_rotated_rect(component_mask, initial_rect, detection)
         else:
             rect = initial_rect
-        # Move just inside the rounded card edge while preserving all four
-        # right angles and parallel opposite sides.
-        inset = max(1.0, min(rect[3] * 0.004, 8.0))
+        # Locate the point where every rounded corner enters card pixels, then
+        # use the deepest required inset on all four sides. Sharing one inset
+        # keeps the result a rectangle and avoids copying scanner background.
+        corner_details: dict = {}
+        if component_mask is not None:
+            _move_corners_inside_component(
+                component_mask, _rect_corners(rect), corner_details,
+            )
+        inset = float(corner_details.get("shared_inset_px", 0.0))
+        if inset <= 0:
+            # Threshold masks can miss a very pale card corner; keep a modest
+            # deterministic safety inset rather than risk a paper sliver.
+            inset = max(1.0, min(rect[3] * 0.012, 12.0))
         rect = (rect[0], rect[1], max(2.0, rect[2] - 2 * inset),
                 max(2.0, rect[3] - 2 * inset), rect[4])
         corners = _rect_corners(rect)
@@ -626,6 +636,7 @@ def process_image(
             "center_x": rect[0], "center_y": rect[1], "width": rect[2],
             "height": rect[3], "angle_degrees": rect[4], "inset_px_per_side": inset,
         }
+        detection["rounded_corner_inset"] = corner_details
         detection["inner_corners_xy"] = corners.tolist()
     info["detection"] = {key: value for key, value in detection.items()}
     info["detection_confidence"] = confidence
