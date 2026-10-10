@@ -161,7 +161,7 @@ def _background_lab(image: np.ndarray) -> np.ndarray:
 def _candidate_contour(
     image: np.ndarray, debug: dict | None = None, *, force_rectangle: bool = False,
 ) -> tuple[np.ndarray | None, float]:
-    """Find the dominant non-background component and fit its outer quadrilateral."""
+    """Rank compact card-shaped components and fit their outer boundary."""
     h, w = image.shape[:2]
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
     bg = _background_lab(image)
@@ -180,86 +180,89 @@ def _candidate_contour(
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         if count <= 1:
             continue
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        idx = int(np.argmax(areas)) + 1
-        area = int(stats[idx, cv2.CC_STAT_AREA])
-        if area < max(500, int(h * w * 0.00025)) or area > h * w * 0.8:
-            continue
-        component = np.where(labels == idx, 255, 0).astype(np.uint8)
-        contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        contour = max(contours, key=cv2.contourArea)
-        hull = cv2.convexHull(contour)
-        quad = None
-        fitted_rect = None
-        fit_mode = "rotated_rectangle" if force_rectangle else "contour_quad"
-        if force_rectangle:
-            # Flatbed scans need rotation only. Fit the whole convex hull as a
-            # single OpenCV RotatedRect, without requiring four independently
-            # detected corners or a polygon approximation with exactly 4 points.
-            fitted = cv2.minAreaRect(hull)
-            box = cv2.boxPoints(fitted).astype(np.float32)
-            center = fitted[0]
-            side_a, side_b = box[1] - box[0], box[2] - box[1]
-            if np.linalg.norm(side_a) >= np.linalg.norm(side_b):
-                width, height, long_axis = np.linalg.norm(side_a), np.linalg.norm(side_b), side_a
+        minimum_area = max(500, int(h * w * 0.00025))
+        candidate_indices = np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1][:24] + 1
+        for idx in candidate_indices:
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < minimum_area or area > h * w * 0.35:
+                continue
+            component = np.where(labels == idx, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            hull = cv2.convexHull(contour)
+            quad = None
+            fitted_rect = None
+            fit_mode = "rotated_rectangle" if force_rectangle else "contour_quad"
+            if force_rectangle:
+                # Flatbed scans need rotation only. Fit this component's whole
+                # hull as one RotatedRect; consider smaller components too,
+                # since background texture may connect into a larger region.
+                fitted = cv2.minAreaRect(hull)
+                box = cv2.boxPoints(fitted).astype(np.float32)
+                center = fitted[0]
+                side_a, side_b = box[1] - box[0], box[2] - box[1]
+                if np.linalg.norm(side_a) >= np.linalg.norm(side_b):
+                    width, height, long_axis = np.linalg.norm(side_a), np.linalg.norm(side_b), side_a
+                else:
+                    width, height, long_axis = np.linalg.norm(side_b), np.linalg.norm(side_a), side_b
+                ratio = max(width, height) / max(1.0, min(width, height))
+                box_area_ratio = (width * height) / (h * w)
+                if 1.35 <= ratio <= 2.05 and box_area_ratio <= 0.35:
+                    quad = _order_points(box)
+                    angle = float(np.degrees(np.arctan2(long_axis[1], long_axis[0])))
+                    fitted_rect = (float(center[0]), float(center[1]), float(width),
+                                   float(height), angle)
             else:
-                width, height, long_axis = np.linalg.norm(side_b), np.linalg.norm(side_a), side_b
-            ratio = max(width, height) / max(1.0, min(width, height))
-            if 1.35 <= ratio <= 2.05:
-                quad = _order_points(box)
-                angle = float(np.degrees(np.arctan2(long_axis[1], long_axis[0])))
-                fitted_rect = (float(center[0]), float(center[1]), float(width),
-                               float(height), angle)
-        else:
-            perimeter = cv2.arcLength(hull, True)
-            for epsilon in (0.012, 0.018, 0.024, 0.032, 0.042, 0.055):
-                approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
-                if len(approx) == 4 and cv2.isContourConvex(approx):
-                    points = approx.reshape(4, 2).astype(np.float32)
-                    ordered = _order_points(points)
-                    widths = (np.linalg.norm(ordered[1] - ordered[0]),
-                              np.linalg.norm(ordered[2] - ordered[3]))
-                    heights = (np.linalg.norm(ordered[3] - ordered[0]),
-                               np.linalg.norm(ordered[2] - ordered[1]))
-                    ratio = max(np.mean(widths), np.mean(heights)) / max(1.0, min(np.mean(widths), np.mean(heights)))
-                    if 1.35 <= ratio <= 2.05:
-                        # Keep perspective correction available for genuine
-                        # camera skew in the optional advanced mode.
-                        if _is_nearly_parallel_card(ordered):
-                            ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
-                            fit_mode = "minimum_area_rectangle"
-                        quad = ordered
-                        break
-        if quad is None:
-            continue
+                perimeter = cv2.arcLength(hull, True)
+                for epsilon in (0.012, 0.018, 0.024, 0.032, 0.042, 0.055):
+                    approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
+                    if len(approx) == 4 and cv2.isContourConvex(approx):
+                        points = approx.reshape(4, 2).astype(np.float32)
+                        ordered = _order_points(points)
+                        widths = (np.linalg.norm(ordered[1] - ordered[0]),
+                                  np.linalg.norm(ordered[2] - ordered[3]))
+                        heights = (np.linalg.norm(ordered[3] - ordered[0]),
+                                   np.linalg.norm(ordered[2] - ordered[1]))
+                        ratio = max(np.mean(widths), np.mean(heights)) / max(1.0, min(np.mean(widths), np.mean(heights)))
+                        box_area_ratio = float(np.mean(widths) * np.mean(heights) / (h * w))
+                        if 1.35 <= ratio <= 2.05 and box_area_ratio <= 0.35:
+                            # Keep perspective correction available for genuine
+                            # camera skew in the optional advanced mode.
+                            if _is_nearly_parallel_card(ordered):
+                                ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
+                                fit_mode = "minimum_area_rectangle"
+                            quad = ordered
+                            break
+            if quad is None:
+                continue
 
-        outer_quad = quad.copy()
-        inset_details: dict = {}
-        inner_quad = quad.copy() if force_rectangle else _move_corners_inside_component(
-            component, quad, inset_details,
-        )
-        if inner_quad is None:
-            continue
+            outer_quad = quad.copy()
+            inset_details: dict = {}
+            inner_quad = quad.copy() if force_rectangle else _move_corners_inside_component(
+                component, quad, inset_details,
+            )
+            if inner_quad is None:
+                continue
 
-        qarea = abs(cv2.contourArea(inner_quad.reshape(-1, 1, 2)))
-        fill = min(1.0, cv2.contourArea(contour) / max(qarea, 1.0))
-        # Prefer a substantial, compact component; weak fits are reviewed manually.
-        score = min(1.0, area / max(h * w * 0.015, 1.0)) * (0.65 + 0.35 * fill)
-        if best is None or score > best[1]:
-            best = (inner_quad, float(score))
-            best_details = {
-                "outer_corners_xy": outer_quad.tolist(),
-                "inner_corners_xy": inner_quad.tolist(),
-                "selected_threshold_lab": threshold,
-                "component_area_px": area,
-                "component_fill_ratio": float(fill),
-                "fit_mode": fit_mode,
-                "initial_rotated_rect": fitted_rect,
-                **inset_details,
-                "component_mask": component,
-            }
+            qarea = abs(cv2.contourArea(inner_quad.reshape(-1, 1, 2)))
+            fill = min(1.0, cv2.contourArea(contour) / max(qarea, 1.0))
+            # Prefer a substantial, compact component; weak fits are reviewed manually.
+            score = min(1.0, area / max(h * w * 0.015, 1.0)) * (0.65 + 0.35 * fill)
+            if best is None or score > best[1]:
+                best = (inner_quad, float(score))
+                best_details = {
+                    "outer_corners_xy": outer_quad.tolist(),
+                    "inner_corners_xy": inner_quad.tolist(),
+                    "selected_threshold_lab": threshold,
+                    "component_area_px": area,
+                    "component_fill_ratio": float(fill),
+                    "fit_mode": fit_mode,
+                    "initial_rotated_rect": fitted_rect,
+                    **inset_details,
+                    "component_mask": component,
+                }
     if debug is not None:
         debug["thresholds_tried_lab"] = thresholds_tried
         if best_details:
