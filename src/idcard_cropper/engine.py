@@ -238,6 +238,66 @@ def _background_lab(image: np.ndarray) -> np.ndarray:
     return np.median(border.reshape(-1, 3), axis=0).astype(np.float32)
 
 
+def _grayscale_rotated_rect_candidate(image: np.ndarray) -> tuple[np.ndarray, float, dict] | None:
+    """Detect a compact dark card with thresholded regions and one RotatedRect."""
+    height, width = image.shape[:2]
+    scale = min(1.0, 1200.0 / max(height, width))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) \
+        if scale < 1.0 else image
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    sh, sw = gray.shape[:2]
+    kernel_size = max(7, int(min(sh, sw) * 0.025))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    candidates: list[tuple[float, np.ndarray, int, float, np.ndarray]] = []
+
+    for threshold in range(70, 181, 5):
+        binary = np.where(gray < threshold, 255, 0).astype(np.uint8)
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(
+            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if not sh * sw * 0.025 < area < sh * sw * 0.65:
+                continue
+            x, y, box_width, box_height = cv2.boundingRect(contour)
+            if x < 3 or y < 3 or x + box_width >= sw - 3 or y + box_height >= sh - 3:
+                continue
+            rect = cv2.minAreaRect(contour)
+            rect_width, rect_height = rect[1]
+            if min(rect_width, rect_height) <= 0:
+                continue
+            ratio = max(rect_width, rect_height) / min(rect_width, rect_height)
+            fill = area / (rect_width * rect_height)
+            if not (1.35 <= ratio <= 1.90 and fill >= 0.83):
+                continue
+            score = area * fill - abs(ratio - 1.58) * area * 0.25
+            component_small = np.zeros((sh, sw), dtype=np.uint8)
+            cv2.drawContours(component_small, [contour], -1, 255, cv2.FILLED)
+            candidates.append((score, cv2.boxPoints(rect), threshold, fill, component_small))
+
+    if not candidates:
+        return None
+    score, points, threshold, fill, component_small = max(candidates, key=lambda item: item[0])
+    points = _order_points(points / scale)
+    component = cv2.resize(component_small, (width, height), interpolation=cv2.INTER_NEAREST) \
+        if scale < 1.0 else component_small
+    rect = _rect_from_corners(points)
+    confidence = float(min(0.86, 0.58 + max(0.0, min(1.0, (fill - 0.83) / 0.17)) * 0.28))
+    return points, confidence, {
+        "outer_corners_xy": points.tolist(),
+        "inner_corners_xy": points.tolist(),
+        "selected_threshold_gray": threshold,
+        "component_area_px": int(np.count_nonzero(component)),
+        "component_fill_ratio": float(fill),
+        "fit_mode": "minimum_area_rectangle",
+        "initial_rotated_rect": rect,
+        "component_mask": component,
+        "gray_threshold_score": float(score),
+    }
+
+
 def _candidate_contour(
     image: np.ndarray, debug: dict | None = None, *, force_rectangle: bool = False,
 ) -> tuple[np.ndarray | None, float]:
@@ -363,6 +423,16 @@ def _candidate_contour(
                     **inset_details,
                     "component_mask": component,
                 }
+
+    # A second, independent detector handles grayscale scans where the LAB
+    # mask merges the card into a large shadow. It models the card as one
+    # rotated rectangle, matching the supplied standalone detector.
+    if best is None:
+        gray_candidate = _grayscale_rotated_rect_candidate(image)
+        if gray_candidate is not None:
+            gray_quad, gray_confidence, gray_details = gray_candidate
+            best = (gray_quad, gray_confidence)
+            best_details = gray_details
 
     # A shadowed or textured scan can make the LAB foreground mask join the
     # card to the surrounding paper. In that case use the card's physical
