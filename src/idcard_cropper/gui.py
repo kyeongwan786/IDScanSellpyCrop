@@ -453,7 +453,7 @@ class MainWindow(QMainWindow):
         self.manual_apply_button.clicked.connect(self.apply_manual_rectangle)
         self.source_preview.rectangle_changed.connect(self.update_live_crop_preview)
         self.file_list.currentItemChanged.connect(self.selection_changed)
-        self.print_button.clicked.connect(self.print_selected)
+        self.print_button.clicked.connect(self.handle_print_clicked)
         self.open_diagnostics_button.clicked.connect(self.open_diagnostics)
         self.open_output_button.clicked.connect(self.open_output)
         # Keep this actionable even before processing so a click can explain
@@ -701,6 +701,7 @@ class MainWindow(QMainWindow):
         # settings are explicit and applied consistently on every print.
         dialog = QDialog(self)
         dialog.setWindowTitle("SELPHY 인쇄 설정")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         form = QFormLayout(dialog)
         printer_combo = QComboBox(dialog)
         printer_combo.addItems(available)
@@ -723,6 +724,8 @@ class MainWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
+        dialog.raise_()
+        dialog.activateWindow()
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -806,6 +809,17 @@ class MainWindow(QMainWindow):
             )
             return
         self.status.setText("인쇄 작업을 프린터로 보냈습니다. 프린터 드라이버에서 카드 용지와 테두리 설정을 확인하세요.")
+
+    def handle_print_clicked(self) -> None:
+        """Make failures before the print dialog visible in packaged builds."""
+        self.status.setText("인쇄 버튼이 눌렸습니다. 프린터와 출력 파일을 확인하고 있습니다…")
+        QApplication.processEvents()
+        try:
+            self.print_selected()
+        except Exception as exc:
+            message = f"인쇄 창을 여는 중 오류가 발생했습니다: {type(exc).__name__}: {exc}"
+            self.status.setText(message)
+            QMessageBox.critical(self, "인쇄 창을 열 수 없음", message)
 
     def save_printer_preferences(self, printer_name: str, parent: QDialog) -> None:
         if not printer_name:
