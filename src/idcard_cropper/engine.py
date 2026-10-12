@@ -1,4 +1,4 @@
-"""Conservative card detection and print-size correction using OpenCV."""
+"""GUI adapter for the single detector and rectification pipeline in id_card_crop."""
 
 from __future__ import annotations
 
@@ -6,15 +6,15 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
-import shutil
-import sys
+
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
-from . import flattening as camera_flatten
 
+import id_card_crop as card_algorithm
 
 PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
+RECOGNITION_DPI = 300
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -30,6 +30,7 @@ class CropResult:
     preview_path: Path | None = None
     debug_dir: Path | None = None
     rectangle: tuple[float, float, float, float, float] | None = None
+    recognition_enhanced_path: Path | None = None
 
 
 def _load_image(path: Path) -> np.ndarray:
@@ -38,1218 +39,322 @@ def _load_image(path: Path) -> np.ndarray:
         return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
-def _order_points(points: np.ndarray) -> np.ndarray:
-    points = np.asarray(points, dtype=np.float32)
-    sums = points.sum(axis=1)
-    diffs = np.diff(points, axis=1).ravel()
-    return np.array(
-        [points[np.argmin(sums)], points[np.argmin(diffs)],
-         points[np.argmax(sums)], points[np.argmax(diffs)]], dtype=np.float32
-    )  # top-left, top-right, bottom-right, bottom-left
-
-
-def _sort_quad(points: np.ndarray) -> np.ndarray:
-    """Order four points cyclically, including cards rotated near 45 degrees."""
-    points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    center = points.mean(axis=0)
-    angles = np.arctan2(points[:, 1] - center[1], points[:, 0] - center[0])
-    ordered = points[np.argsort(angles)]
-    return np.roll(ordered, -int(np.argmin(ordered.sum(axis=1))), axis=0)
-
-
-def _fullauto_masks(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    """Build distinct foreground/edge masks for photographed card boundaries."""
-    height, width = image.shape[:2]
-    blurred = cv2.GaussianBlur(image, (5, 5), 0)
-    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-    border_width = max(2, width // 35)
-    border_height = max(2, height // 35)
-    border = np.concatenate((
-        blurred[:border_height].reshape(-1, 3),
-        blurred[-border_height:].reshape(-1, 3),
-        blurred[:, :border_width].reshape(-1, 3),
-        blurred[:, -border_width:].reshape(-1, 3),
-    ))
-    background = np.median(border.astype(np.float32), axis=0)
-    difference = np.max(np.abs(blurred.astype(np.float32) - background), axis=2)
-    masks: list[tuple[str, np.ndarray]] = [
-        (f"background_{threshold}", np.uint8(difference > threshold) * 255)
-        for threshold in (17, 28, 42)
-    ]
-    for threshold in (120, 150, 180, 210):
-        masks.append((f"bright_{threshold}", np.uint8(gray > threshold) * 255))
-        masks.append((f"dark_{threshold}", np.uint8(gray < threshold) * 255))
-    masks.append(("edges", cv2.Canny(gray, 35, 110)))
-
-    kernel_size = max(5, int(min(height, width) * 0.018) // 2 * 2 + 1)
-    ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    edge_size = max(5, kernel_size // 2 * 2 + 1)
-    edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_size, edge_size))
-    return [
-        (name, cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                edge_kernel if name == "edges" else ellipse))
-        for name, mask in masks
-    ]
-
-
-def _quad_border_contrast(gray: np.ndarray, points: np.ndarray) -> float:
-    """Measure the grayscale jump across the four proposed card edges."""
-    points = _sort_quad(points)
-    center = points.mean(axis=0)
-    height, width = gray.shape[:2]
-    delta = max(3.0, min(height, width) * 0.008)
-    edge_values: list[float] = []
-    for start, end in zip(points, np.roll(points, -1, axis=0)):
-        vector = end - start
-        if float(np.linalg.norm(vector)) < 20:
-            continue
-        midpoint = (start + end) / 2
-        inward = center - midpoint
-        inward /= max(float(np.linalg.norm(inward)), 1.0)
-        samples: list[float] = []
-        for fraction in np.linspace(0.12, 0.88, 13):
-            point = start * (1.0 - fraction) + end * fraction
-            inside = np.rint(point + inward * delta).astype(int)
-            outside = np.rint(point - inward * delta).astype(int)
-            if (0 <= inside[0] < width and 0 <= inside[1] < height
-                    and 0 <= outside[0] < width and 0 <= outside[1] < height):
-                samples.append(abs(int(gray[inside[1], inside[0]])
-                                   - int(gray[outside[1], outside[0]])))
-        if samples:
-            edge_values.append(float(np.median(samples)))
-    return float(np.mean(edge_values)) if edge_values else 0.0
-
-
-def _detect_fullauto_quad(image: np.ndarray) -> tuple[np.ndarray, float, dict] | None:
-    """Find four card corners from the full-auto camera-photo detector masks."""
-    image_height, image_width = image.shape[:2]
-    scale = min(1.0, 1500.0 / max(image_height, image_width))
-    work = (cv2.resize(image, (round(image_width * scale), round(image_height * scale)),
-                       interpolation=cv2.INTER_AREA) if scale < 1.0 else image)
-    height, width = work.shape[:2]
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    target_ratio = 8.1 / 5.1
-    candidates: list[tuple[float, np.ndarray, dict]] = []
-
-    for mask_name, mask in _fullauto_masks(work):
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:25]:
-            area = float(cv2.contourArea(contour))
-            area_fraction = area / max(float(width * height), 1.0)
-            if not 0.025 <= area_fraction <= 0.80:
-                continue
-            x, y, box_width, box_height = cv2.boundingRect(contour)
-            margin = max(3, int(min(height, width) * 0.006))
-            if (x <= margin or y <= margin or x + box_width >= width - margin
-                    or y + box_height >= height - margin):
-                continue
-
-            rectangle = cv2.minAreaRect(contour)
-            rect_width, rect_height = rectangle[1]
-            if min(rect_width, rect_height) < 25:
-                continue
-            ratio = max(rect_width, rect_height) / min(rect_width, rect_height)
-            fill = area / (rect_width * rect_height)
-            if not 1.35 <= ratio <= 1.90 or not 0.57 <= fill <= 1.13:
-                continue
-
-            quad = cv2.boxPoints(rectangle)
-            method = "rotated_rectangle"
-            perimeter = cv2.arcLength(contour, True)
-            approximation = cv2.approxPolyDP(contour, 0.027 * perimeter, True)
-            if len(approximation) == 4 and cv2.isContourConvex(approximation):
-                measured = _sort_quad(approximation.reshape(4, 2))
-                side_lengths = np.linalg.norm(np.roll(measured, -1, axis=0) - measured, axis=1)
-                measured_ratio = max(side_lengths) / max(float(min(side_lengths)), 1.0)
-                polygon_area = cv2.contourArea(measured)
-                if 1.35 <= measured_ratio <= 1.90 and polygon_area >= 0.72 * rect_width * rect_height:
-                    quad, method = measured, "four_corners"
-            quad = _sort_quad(quad)
-            contrast = _quad_border_contrast(gray, quad)
-            score = (
-                65.0 - 120.0 * abs(math.log(ratio / target_ratio))
-                + 55.0 * min(fill, 1.0)
-                + min(40.0, contrast) * 1.1
-                + min(area_fraction, 0.22) * 65.0
-                + (7.0 if method == "four_corners" else 0.0)
-            )
-            candidates.append((score, quad, {
-                "fit_mode": f"fullauto_{method}",
-                "detector_mask": mask_name,
-                "detector_fill_ratio": float(fill),
-                "detector_border_contrast": float(contrast),
-                "detector_area_fraction": float(area_fraction),
-                "detector_score": float(score),
-            }))
-
-    if not candidates:
-        return None
-    score, points, details = max(candidates, key=lambda candidate: candidate[0])
-    contrast = details["detector_border_contrast"]
-    if score < 105 or contrast < 10:
-        return None
-    points = points / scale
-    confidence = float(min(0.96, 0.55 + (score - 105.0) * 0.006))
-    return points, confidence, {"outer_corners_xy": points.tolist(), **details}
-
-
-def _fit_quad_edges(contour: np.ndarray, seed: np.ndarray) -> tuple[np.ndarray | None, dict]:
-    """Fit each long card edge and intersect the four lines for stable corners."""
-    points = contour.reshape(-1, 2).astype(np.float32)
-    seed = _order_points(seed)
-    side_lengths = [float(np.linalg.norm(seed[(i + 1) % 4] - seed[i])) for i in range(4)]
-    band = max(24.0, min(min(side_lengths) * 0.07, 80.0))
-    fitted_lines: list[tuple[np.ndarray, float]] = []
-    residuals: list[float] = []
-
-    for index in range(4):
-        start, end = seed[index], seed[(index + 1) % 4]
-        vector = end - start
-        length = float(np.linalg.norm(vector))
-        if length < 2:
-            return None, {}
-        axis = vector / length
-        normal = np.array([-axis[1], axis[0]], dtype=np.float32)
-        relative = points - start
-        along = relative @ axis
-        across = relative @ normal
-        selected = points[(along > length * 0.12) & (along < length * 0.88)
-                          & (np.abs(across) < band)]
-        if len(selected) < 30:
-            return None, {}
-
-        vx, vy, _, _ = cv2.fitLine(
-            selected.reshape(-1, 1, 2), cv2.DIST_HUBER, 0, 0.01, 0.01,
-        ).reshape(-1)
-        direction = np.array([vx, vy], dtype=np.float32)
-        direction /= max(float(np.linalg.norm(direction)), 1e-6)
-        line_normal = np.array([-direction[1], direction[0]], dtype=np.float32)
-        offset = float(np.median(selected @ line_normal))
-        error = np.abs(selected @ line_normal - offset)
-        p90 = float(np.percentile(error, 90))
-        if p90 > band * 0.65:
-            return None, {}
-        fitted_lines.append((line_normal, offset))
-        residuals.append(p90)
-
-    corners = []
-    for index in range(4):
-        previous_normal, previous_offset = fitted_lines[(index - 1) % 4]
-        next_normal, next_offset = fitted_lines[index]
-        matrix = np.stack((previous_normal, next_normal))
-        if abs(float(np.linalg.det(matrix))) < 0.15:
-            return None, {}
-        point = np.linalg.solve(matrix, np.array([previous_offset, next_offset]))
-        corners.append(point)
-    fitted = np.asarray(corners, dtype=np.float32)
-    if not cv2.isContourConvex(fitted.reshape(-1, 1, 2)):
-        return None, {}
-    max_shift = max(float(np.linalg.norm(a - b)) for a, b in zip(seed, fitted))
-    if max_shift > min(side_lengths) * 0.12:
-        return None, {}
-    return fitted, {"edge_fit_p90_residual_px": residuals,
-                    "edge_fit_max_corner_shift_px": max_shift}
-
-
-def _is_nearly_parallel_card(quad: np.ndarray) -> bool:
-    """Return true when a scan is a rotated rectangle with negligible perspective."""
-    tl, tr, br, bl = quad
-    edges = (tr - tl, br - bl, bl - tl, br - tr)
-    lengths = [float(np.linalg.norm(edge)) for edge in edges]
-    if min(lengths) <= 0:
-        return False
-
-    def direction_delta(a: np.ndarray, b: np.ndarray) -> float:
-        angle_a = float(np.degrees(np.arctan2(a[1], a[0])))
-        angle_b = float(np.degrees(np.arctan2(b[1], b[0])))
-        return abs((angle_a - angle_b + 90.0) % 180.0 - 90.0)
-
-    width_delta = abs(lengths[0] - lengths[1]) / max(lengths[0], lengths[1])
-    height_delta = abs(lengths[2] - lengths[3]) / max(lengths[2], lengths[3])
-    # Fit lines ignore rounded corners. Only suppress perspective correction
-    # when opposite edges are actually close to parallel and equal in length.
-    return (max(width_delta, height_delta) <= 0.06
-            and direction_delta(edges[0], edges[1]) <= 2.5
-            and direction_delta(edges[2], edges[3]) <= 2.5)
-
-
-def _move_corners_inside_component(
-    mask: np.ndarray, quad: np.ndarray, details: dict | None = None,
-) -> np.ndarray | None:
-    """Inset all four corners equally until each lies inside the detected card."""
-    tl, tr, br, bl = quad
-
-    def unit(vector: np.ndarray) -> np.ndarray:
-        length = float(np.linalg.norm(vector))
-        return vector / length if length > 0 else vector
-
-    inward_axes = (
-        (unit(tr - tl), unit(bl - tl)),
-        (unit(tl - tr), unit(br - tr)),
-        (unit(tr - br), unit(bl - br)),
-        (unit(br - bl), unit(tl - bl)),
-    )
-    side_lengths = (np.linalg.norm(tr - tl), np.linalg.norm(br - bl),
-                    np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
-    max_inset = max(1, int(round(min(side_lengths) * 0.05)))
-    required: list[int] = []
-    height, width = mask.shape[:2]
-
-    for corner, (axis_a, axis_b) in zip(quad, inward_axes):
-        entry = None
-        for distance in range(max_inset + 1):
-            point = np.rint(corner + distance * (axis_a + axis_b)).astype(int)
-            x, y = int(point[0]), int(point[1])
-            if not (0 <= x < width and 0 <= y < height):
-                continue
-            # Require a short continuous run so a stray background speck
-            # cannot make a rounded corner look like part of the card.
-            run = True
-            for extra in (1, 2):
-                sample = np.rint(corner + (distance + extra) * (axis_a + axis_b)).astype(int)
-                sx, sy = int(sample[0]), int(sample[1])
-                if not (0 <= sx < width and 0 <= sy < height and mask[sy, sx]):
-                    run = False
-                    break
-            if mask[y, x] and run:
-                entry = distance
-                break
-        if entry is None:
-            return None
-        required.append(entry)
-
-    # One shared inset keeps all four crop edges parallel. Use the deepest
-    # corner entry so every point is inside the card rather than on scan paper.
-    inset = max(required)
-    if details is not None:
-        details.update(corner_entry_px=required, shared_inset_px=inset)
-    adjusted = np.array([
-        corner + inset * (axis_a + axis_b)
-        for corner, (axis_a, axis_b) in zip(quad, inward_axes)
-    ], dtype=np.float32)
-    return adjusted
-
-
-def _inset_quad_uniform(quad: np.ndarray, inset: float) -> np.ndarray:
-    """Move each quad corner inward by the same distance along both edges."""
-    tl, tr, br, bl = quad
-
-    def unit(vector: np.ndarray) -> np.ndarray:
-        length = float(np.linalg.norm(vector))
-        return vector / length if length > 0 else vector
-
-    axes = (
-        (unit(tr - tl), unit(bl - tl)),
-        (unit(tl - tr), unit(br - tr)),
-        (unit(tr - br), unit(bl - br)),
-        (unit(br - bl), unit(tl - bl)),
-    )
-    return np.asarray([
-        corner + inset * (axis_a + axis_b)
-        for corner, (axis_a, axis_b) in zip(quad, axes)
-    ], dtype=np.float32)
-
-
-def _deskew_scan(image: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Rotate the scan so the detected card edge is horizontal before cropping."""
-    edge = corners[1] - corners[0]
-    angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
-    if abs(angle) < 0.05:
-        return image, corners
-
-    height, width = image.shape[:2]
-    center = (width / 2.0, height / 2.0)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cosine, sine = abs(matrix[0, 0]), abs(matrix[0, 1])
-    new_width = int(round(height * sine + width * cosine))
-    new_height = int(round(height * cosine + width * sine))
-    matrix[0, 2] += new_width / 2.0 - center[0]
-    matrix[1, 2] += new_height / 2.0 - center[1]
-
-    rotated = cv2.warpAffine(
-        image, matrix, (new_width, new_height), flags=cv2.INTER_CUBIC,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255),
-    )
-    aligned_corners = cv2.transform(corners[None, :, :], matrix)[0]
-    return rotated, aligned_corners
-
-
-def _background_lab(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
-    band = max(2, int(min(h, w) * 0.025))
-    border_pixels = np.concatenate((
-        image[:band].reshape(-1, 3), image[-band:].reshape(-1, 3),
-        image[:, :band].reshape(-1, 3), image[:, -band:].reshape(-1, 3),
-    ))
-    border = cv2.cvtColor(border_pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB)
-    return np.median(border.reshape(-1, 3), axis=0).astype(np.float32)
-
-
-def _grayscale_rotated_rect_candidate(image: np.ndarray) -> tuple[np.ndarray, float, dict] | None:
-    """Detect a compact dark card with thresholded regions and one RotatedRect."""
-    height, width = image.shape[:2]
-    scale = min(1.0, 1200.0 / max(height, width))
-    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) \
-        if scale < 1.0 else image
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    sh, sw = gray.shape[:2]
-    kernel_size = max(7, int(min(sh, sw) * 0.025))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    candidates: list[tuple[float, np.ndarray, int, float, np.ndarray]] = []
-
-    for threshold in range(70, 181, 5):
-        binary = np.where(gray < threshold, 255, 0).astype(np.uint8)
-        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(
-            closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-        )
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if not sh * sw * 0.025 < area < sh * sw * 0.65:
-                continue
-            x, y, box_width, box_height = cv2.boundingRect(contour)
-            if x < 3 or y < 3 or x + box_width >= sw - 3 or y + box_height >= sh - 3:
-                continue
-            rect = cv2.minAreaRect(contour)
-            rect_width, rect_height = rect[1]
-            if min(rect_width, rect_height) <= 0:
-                continue
-            ratio = max(rect_width, rect_height) / min(rect_width, rect_height)
-            fill = area / (rect_width * rect_height)
-            if not (1.35 <= ratio <= 1.90 and fill >= 0.83):
-                continue
-            score = area * fill - abs(ratio - 1.58) * area * 0.25
-            component_small = np.zeros((sh, sw), dtype=np.uint8)
-            cv2.drawContours(component_small, [contour], -1, 255, cv2.FILLED)
-            candidates.append((score, cv2.boxPoints(rect), threshold, fill, component_small))
-
-    if not candidates:
-        return None
-    score, points, threshold, fill, component_small = max(candidates, key=lambda item: item[0])
-    points = _order_points(points / scale)
-    component = cv2.resize(component_small, (width, height), interpolation=cv2.INTER_NEAREST) \
-        if scale < 1.0 else component_small
-    rect = _rect_from_corners(points)
-    confidence = float(min(0.86, 0.58 + max(0.0, min(1.0, (fill - 0.83) / 0.17)) * 0.28))
-    return points, confidence, {
-        "outer_corners_xy": points.tolist(),
-        "inner_corners_xy": points.tolist(),
-        "selected_threshold_gray": threshold,
-        "component_area_px": int(np.count_nonzero(component)),
-        "component_fill_ratio": float(fill),
-        "fit_mode": "minimum_area_rectangle",
-        "initial_rotated_rect": rect,
-        "component_mask": component,
-        "gray_threshold_score": float(score),
-    }
-
-
-def _candidate_contour(
-    image: np.ndarray, debug: dict | None = None, *, force_rectangle: bool = False,
-) -> tuple[np.ndarray | None, float]:
-    """Rank compact card-shaped components and fit their outer boundary."""
-    h, w = image.shape[:2]
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-    bg = _background_lab(image)
-    distance = np.linalg.norm(lab - bg[None, None, :], axis=2)
-    k = max(3, int(round(min(h, w) * 0.004)) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    best: tuple[np.ndarray, float] | None = None
-    best_details: dict | None = None
-    thresholds_tried: list[float] = []
-
-    # Multiple thresholds handle both faint card edges and patterned cards.
-    for threshold in (7.0, 10.0, 14.0, 19.0, 25.0, 32.0):
-        thresholds_tried.append(threshold)
-        mask = (distance >= threshold).astype(np.uint8) * 255
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        if count <= 1:
-            continue
-        minimum_area = max(500, int(h * w * 0.00025))
-        candidate_indices = np.argsort(stats[1:, cv2.CC_STAT_AREA])[::-1][:24] + 1
-        for idx in candidate_indices:
-            area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area < minimum_area or area > h * w * 0.35:
-                continue
-            component = np.where(labels == idx, 255, 0).astype(np.uint8)
-            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-            contour = max(contours, key=cv2.contourArea)
-            hull = cv2.convexHull(contour)
-            quad = None
-            fitted_rect = None
-            edge_fit_details: dict = {}
-            fit_mode = "rotated_rectangle" if force_rectangle else "contour_quad"
-            if force_rectangle:
-                # Flatbed scans need rotation only. Fit this component's whole
-                # hull as one RotatedRect; consider smaller components too,
-                # since background texture may connect into a larger region.
-                fitted = cv2.minAreaRect(hull)
-                box = cv2.boxPoints(fitted).astype(np.float32)
-                center = fitted[0]
-                side_a, side_b = box[1] - box[0], box[2] - box[1]
-                if np.linalg.norm(side_a) >= np.linalg.norm(side_b):
-                    width, height, long_axis = np.linalg.norm(side_a), np.linalg.norm(side_b), side_a
-                else:
-                    width, height, long_axis = np.linalg.norm(side_b), np.linalg.norm(side_a), side_b
-                ratio = max(width, height) / max(1.0, min(width, height))
-                box_area_ratio = (width * height) / (h * w)
-                if 1.35 <= ratio <= 2.05 and box_area_ratio <= 0.35:
-                    quad = _order_points(box)
-                    angle = float(np.degrees(np.arctan2(long_axis[1], long_axis[0])))
-                    fitted_rect = (float(center[0]), float(center[1]), float(width),
-                                   float(height), angle)
-            else:
-                perimeter = cv2.arcLength(hull, True)
-                for epsilon in (0.012, 0.018, 0.024, 0.032, 0.042, 0.055):
-                    approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
-                    if len(approx) == 4 and cv2.isContourConvex(approx):
-                        points = approx.reshape(4, 2).astype(np.float32)
-                        ordered = _order_points(points)
-                        widths = (np.linalg.norm(ordered[1] - ordered[0]),
-                                  np.linalg.norm(ordered[2] - ordered[3]))
-                        heights = (np.linalg.norm(ordered[3] - ordered[0]),
-                                   np.linalg.norm(ordered[2] - ordered[1]))
-                        ratio = max(np.mean(widths), np.mean(heights)) / max(1.0, min(np.mean(widths), np.mean(heights)))
-                        box_area_ratio = float(np.mean(widths) * np.mean(heights) / (h * w))
-                        if 1.35 <= ratio <= 2.05 and box_area_ratio <= 0.35:
-                            fitted_quad, edge_fit_details = _fit_quad_edges(contour, ordered)
-                            if fitted_quad is not None:
-                                ordered = fitted_quad
-                                fit_mode = "fitted_edge_quad"
-                            # Flatbed scans have parallel edges; genuine
-                            # camera skew keeps the four fitted edge lines.
-                            if _is_nearly_parallel_card(ordered):
-                                ordered = _order_points(cv2.boxPoints(cv2.minAreaRect(hull)))
-                                fit_mode = "minimum_area_rectangle"
-                                fitted_rect = _rect_from_corners(ordered)
-                            quad = ordered
-                            break
-            if quad is None:
-                continue
-
-            outer_quad = quad.copy()
-            inset_details: dict = {}
-            inner_quad = quad.copy() if force_rectangle else _move_corners_inside_component(
-                component, quad, inset_details,
-            )
-            if inner_quad is None and fit_mode == "minimum_area_rectangle":
-                # Rounded card corners can leave the ideal rectangular corner
-                # just outside the threshold mask. Keep the fitted rectangle
-                # and inset all four sides by the same amount.
-                fitted_rect = _rect_from_corners(quad)
-                inset = max(1.0, min(fitted_rect[3] * 0.025, 30.0))
-                inner_quad = _rect_corners((
-                    fitted_rect[0], fitted_rect[1],
-                    fitted_rect[2] - 2 * inset,
-                    fitted_rect[3] - 2 * inset,
-                    fitted_rect[4],
-                ))
-                inset_details["shared_inset_px"] = inset
-            if inner_quad is None:
-                continue
-
-            qarea = abs(cv2.contourArea(inner_quad.reshape(-1, 1, 2)))
-            fill = min(1.0, cv2.contourArea(contour) / max(qarea, 1.0))
-            # Prefer a substantial, compact component; weak fits are reviewed manually.
-            score = min(1.0, area / max(h * w * 0.015, 1.0)) * (0.65 + 0.35 * fill)
-            if best is None or score > best[1]:
-                best = (inner_quad, float(score))
-                best_details = {
-                    "outer_corners_xy": outer_quad.tolist(),
-                    "inner_corners_xy": inner_quad.tolist(),
-                    "selected_threshold_lab": threshold,
-                    "component_area_px": area,
-                    "component_fill_ratio": float(fill),
-                    "fit_mode": fit_mode,
-                    "initial_rotated_rect": fitted_rect,
-                    **edge_fit_details,
-                    **inset_details,
-                    "component_mask": component,
-                }
-
-    # A second, independent detector handles grayscale scans where the LAB
-    # mask merges the card into a large shadow. It models the card as one
-    # rotated rectangle, matching the supplied standalone detector.
-    if best is None:
-        gray_candidate = _grayscale_rotated_rect_candidate(image)
-        if gray_candidate is not None:
-            gray_quad, gray_confidence, gray_details = gray_candidate
-            best = (gray_quad, gray_confidence)
-            best_details = gray_details
-
-    # A shadowed or textured scan can make the LAB foreground mask join the
-    # card to the surrounding paper. In that case use the card's physical
-    # outline edges as a separate fallback instead of returning no candidate.
-    # Closing the Canny map joins the four long edges across rounded corners;
-    # polygon approximation then gives one shared four-corner outline.
-    if best is None:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        minimum_dimension = min(h, w)
-        close_sizes = sorted({
-            max(9, int(round(minimum_dimension * fraction)) | 1)
-            for fraction in (0.008, 0.010, 0.012)
-        })
-        edge_candidates: list[tuple[float, np.ndarray, dict]] = []
-        for low, high in ((8, 28), (12, 40), (18, 55)):
-            edges = cv2.Canny(gray, low, high)
-            for close_size in close_sizes:
-                close_kernel = cv2.getStructuringElement(
-                    cv2.MORPH_RECT, (close_size, close_size),
-                )
-                closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
-                contours, _ = cv2.findContours(
-                    closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-                )
-                for contour in contours:
-                    area = float(cv2.contourArea(contour))
-                    area_ratio = area / max(float(h * w), 1.0)
-                    if not 0.035 <= area_ratio <= 0.32:
-                        continue
-                    x, y, box_w, box_h = cv2.boundingRect(contour)
-                    margin = max(2, int(minimum_dimension * 0.008))
-                    if x <= margin or y <= margin or x + box_w >= w - margin or y + box_h >= h - margin:
-                        continue
-
-                    hull = cv2.convexHull(contour)
-                    perimeter = cv2.arcLength(hull, True)
-                    if perimeter < 4:
-                        continue
-                    quad = None
-                    for epsilon in (0.008, 0.012, 0.016, 0.022, 0.030, 0.040):
-                        approx = cv2.approxPolyDP(hull, epsilon * perimeter, True)
-                        if len(approx) == 4 and cv2.isContourConvex(approx):
-                            candidate_quad = _order_points(approx.reshape(4, 2))
-                            lengths = [float(np.linalg.norm(
-                                candidate_quad[(i + 1) % 4] - candidate_quad[i]
-                            )) for i in range(4)]
-                            ratio = max(lengths) / max(min(lengths), 1.0)
-                            if 1.35 <= ratio <= 2.05:
-                                quad = candidate_quad
-                                break
-                    if quad is None:
-                        continue
-
-                    # Prefer a plausible ID aspect and a compact outline. The
-                    # edge map often contains shadows, so contour area alone
-                    # must not reward the largest closed region.
-                    lengths = [float(np.linalg.norm(quad[(i + 1) % 4] - quad[i]))
-                               for i in range(4)]
-                    ratio = max(np.mean(lengths[0::2]), np.mean(lengths[1::2])) / max(
-                        min(np.mean(lengths[0::2]), np.mean(lengths[1::2])), 1.0,
-                    )
-                    quad_area_ratio = abs(float(cv2.contourArea(quad.reshape(-1, 1, 2)))) / (h * w)
-                    if not 0.035 <= quad_area_ratio <= 0.32:
-                        continue
-                    ratio_score = max(0.0, 1.0 - abs(ratio - 1.59) / 0.55)
-                    area_score = max(0.0, 1.0 - abs(quad_area_ratio - 0.16) / 0.20)
-                    score = 0.60 * ratio_score + 0.40 * area_score
-                    edge_candidates.append((score, quad, {
-                        "fit_mode": "canny_edge_quad",
-                        "edge_detector": {"canny_low": low, "canny_high": high,
-                                          "close_kernel_px": close_size},
-                        "component_area_px": int(area),
-                        "component_fill_ratio": float(area / max(
-                            abs(float(cv2.contourArea(quad.reshape(-1, 1, 2)))), 1.0,
-                        )),
-                        "selected_threshold_lab": None,
-                    }))
-
-        if edge_candidates:
-            score, quad, details = max(edge_candidates, key=lambda item: item[0])
-            # Keep a small, equal inset on all sides so rounded card corners
-            # and the outermost antialiasing/shadow pixels do not enter print.
-            lengths = [float(np.linalg.norm(quad[(i + 1) % 4] - quad[i]))
-                       for i in range(4)]
-            inset = max(1.0, min(min(lengths) * 0.012, 18.0))
-            inner_quad = _inset_quad_uniform(quad, inset)
-            best = (inner_quad, float(min(0.82, 0.50 + score * 0.30)))
-            best_details = {
-                "outer_corners_xy": quad.tolist(),
-                "inner_corners_xy": inner_quad.tolist(),
-                **details,
-                "edge_shared_inset_px": inset,
-            }
-    if debug is not None:
-        debug["thresholds_tried_lab"] = thresholds_tried
-        if best_details:
-            debug.update(best_details)
-    return best if best else (None, 0.0)
-
-
-def _rect_from_corners(corners: np.ndarray) -> tuple[float, float, float, float, float]:
-    """Convert ordered rectangle corners to center, width, height and angle."""
-    tl, tr, br, bl = np.asarray(corners, dtype=np.float32)
-    horizontal = (tr - tl + br - bl) / 2.0
-    vertical = (bl - tl + br - tr) / 2.0
-    width = float(np.linalg.norm(horizontal))
-    height = float(np.linalg.norm(vertical))
-    if width < height:
-        horizontal, vertical = vertical, -horizontal
-        width, height = height, width
-    angle = float(np.degrees(np.arctan2(horizontal[1], horizontal[0])))
-    center = np.mean(np.asarray(corners, dtype=np.float32), axis=0)
-    return float(center[0]), float(center[1]), width, height, angle
-
-
-def _rect_corners(rect: tuple[float, float, float, float, float]) -> np.ndarray:
-    cx, cy, width, height, angle = rect
-    theta = np.deg2rad(angle)
-    u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
-    v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float32)
-    center = np.array([cx, cy], dtype=np.float32)
-    half_u, half_v = u * (width / 2.0), v * (height / 2.0)
-    return np.array([center - half_u - half_v, center + half_u - half_v,
-                     center + half_u + half_v, center - half_u + half_v], dtype=np.float32)
-
-
-def _rect_mask_score(mask: np.ndarray, rect: tuple[float, float, float, float, float]) -> float:
-    """Score card-mask coverage and occupancy inside a candidate rotated rectangle."""
-    height, width = mask.shape[:2]
-    polygon = np.rint(_rect_corners(rect)).astype(np.int32)
-    if (polygon[:, 0].min() < 0 or polygon[:, 1].min() < 0
-            or polygon[:, 0].max() >= width or polygon[:, 1].max() >= height):
-        return -1.0
-    region = np.zeros(mask.shape, dtype=np.uint8)
-    cv2.fillConvexPoly(region, polygon, 255)
-    inside = (region != 0)
-    count_inside = int(np.count_nonzero(inside))
-    if count_inside == 0:
-        return -1.0
-    total = max(1, int(np.count_nonzero(mask)))
-    covered = int(np.count_nonzero((mask != 0) & inside)) / total
-    occupied = int(np.count_nonzero((mask != 0) & inside)) / count_inside
-    # The harmonic mean strongly rejects both clipped edges and excess background.
-    return 2.0 * covered * occupied / max(covered + occupied, 1e-6)
-
-
-def _refine_rotated_rect(
-    mask: np.ndarray, rect: tuple[float, float, float, float, float],
-    details: dict | None = None,
-) -> tuple[float, float, float, float, float]:
-    """Coordinate-search a five-parameter rectangle against the detected card mask."""
-    # Optimize at a bounded scale to keep large scanner files responsive.
-    full_h, full_w = mask.shape[:2]
-    scale = min(1.0, 900.0 / max(full_h, full_w))
-    if scale < 1.0:
-        work = cv2.resize(mask, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
-        current = (rect[0] * scale, rect[1] * scale, rect[2] * scale,
-                   rect[3] * scale, rect[4])
-    else:
-        work, current = mask, rect
-    _, labels = cv2.threshold(work, 0, 255, cv2.THRESH_BINARY)
-    current_score = _rect_mask_score(labels, current)
-    # Optimize the five rectangle parameters, rather than moving individual
-    # corners. The model guarantees right angles and parallel opposite sides.
-    base = max(current[2], current[3])
-    steps = [max(1.0, base * 0.012), max(0.5, base * 0.003), max(0.25, base * 0.0008)]
-    angle_steps = [0.5, 0.12, 0.03]
-    for step, angle_step in zip(steps, angle_steps):
-        for parameter, delta in ((0, step), (1, step), (2, step), (3, step), (4, angle_step)):
-            best, best_score = current, current_score
-            for offset in (-2.0, -1.0, 0.0, 1.0, 2.0):
-                candidate = list(current)
-                candidate[parameter] += offset * delta
-                if parameter in (2, 3) and candidate[parameter] <= 0:
-                    continue
-                candidate = tuple(candidate)
-                score = _rect_mask_score(labels, candidate)
-                if score > best_score + 1e-7:
-                    best, best_score = candidate, score
-            current, current_score = best, best_score
-    if scale < 1.0:
-        current = (current[0] / scale, current[1] / scale, current[2] / scale,
-                   current[3] / scale, current[4])
-    if details is not None:
-        details.update(rectangle_initial=rect, rectangle_refined=current,
-                       rectangle_mask_score=float(current_score), refinement_scale=scale)
-    return current
-
-
-def _rectified_crop(
-    image: np.ndarray, rect: tuple[float, float, float, float, float],
-    debug: dict | None = None,
-) -> np.ndarray:
-    """Rotate and crop a RotatedRect through an affine transform (no perspective warp)."""
-    cx, cy, width, height, angle = rect
-    out_w, out_h = max(2, int(round(width))), max(2, int(round(height)))
-    corners = _rect_corners(rect)
-    destination = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1]], dtype=np.float32)
-    matrix = cv2.getAffineTransform(corners[:3], destination)
-    if debug is not None:
-        debug["rectangle_affine_matrix"] = matrix
-        debug["warp_destination_size_px"] = [out_w, out_h]
-        debug["rectangle_parameters"] = {
-            "center_x": cx, "center_y": cy, "width": width,
-            "height": height, "angle_degrees": angle,
-        }
-    return cv2.warpAffine(image, matrix, (out_w, out_h), flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_REPLICATE)
-
-
-def _save_debug_image(folder: Path, name: str, image: np.ndarray) -> Path:
-    path = folder / name
-    if image.ndim == 2:
-        Image.fromarray(image.astype(np.uint8)).save(path)
-    else:
-        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(path, quality=94)
-    return path
-
-
-def _draw_debug_corners(image: np.ndarray, corners: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
-    marked = image.copy()
-    cv2.polylines(marked, [corners.astype(np.int32)], True, color, 3)
-    for index, point in enumerate(corners.astype(int)):
-        cv2.circle(marked, tuple(point), 5, (0, 0, 255), -1)
-        cv2.putText(marked, str(index + 1), tuple(point + 8), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (0, 0, 255), 2)
-    return marked
-
-
-def _write_debug_log(folder: Path, info: dict) -> None:
-    path = folder / "run.json"
-
-    def to_json(value):
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, (np.integer, np.floating)):
-            return value.item()
-        raise TypeError(f"Unsupported debug value: {type(value).__name__}")
-
-    path.write_text(json.dumps(info, ensure_ascii=False, indent=2, default=to_json), encoding="utf-8")
-
-
-def _warp(image: np.ndarray, corners: np.ndarray, debug: dict | None = None) -> np.ndarray:
-    tl, tr, br, bl = corners
-    width = int(round(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))))
-    height = int(round(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))))
-    if width < 2 or height < 2:
-        raise ValueError("검출된 카드 경계의 크기가 너무 작습니다.")
-    destination = np.array([[0, 0], [width - 1, 0],
-                            [width - 1, height - 1], [0, height - 1]], dtype=np.float32)
-    matrix = cv2.getPerspectiveTransform(corners.astype(np.float32), destination)
-    if debug is not None:
-        debug["perspective_transform_matrix"] = matrix
-        debug["warp_destination_size_px"] = [width, height]
-    return cv2.warpPerspective(image, matrix, (width, height), flags=cv2.INTER_CUBIC,
-                               borderMode=cv2.BORDER_REPLICATE)
-
-
-def _read_rotation(
-    card: np.ndarray, score_log: list[dict] | None = None,
-) -> tuple[int | None, str | None]:
-    """Choose orientation from local OCR confidence, without retaining recognized text."""
-    try:
-        import pytesseract
-        from pytesseract import Output
-        app_root = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-        if getattr(sys, "frozen", False):
-            bundled_tesseract = app_root / "tesseract" / "tesseract.exe"
-            if bundled_tesseract.is_file():
-                pytesseract.pytesseract.tesseract_cmd = str(bundled_tesseract)
-            else:
-                return None, "패키지에 포함된 Tesseract 실행 파일을 찾지 못했습니다. 다시 빌드해야 합니다."
-
-        tessdata_dir = app_root / "tessdata"
-        korean_model = tessdata_dir / "kor.traineddata"
-        if not korean_model.is_file():
-            tessdata_dir = Path(__file__).parent / "tessdata"
-            korean_model = tessdata_dir / "kor.traineddata"
-        if korean_model.is_file():
-            # Passing an absolute Windows path through pytesseract's config
-            # parser strips backslashes or retains quotes, so use the
-            # TESSDATA_PREFIX environment variable instead.
-            import os
-            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
-            try:
-                pytesseract.get_tesseract_version()
-            except Exception as exc:
-                return None, f"Tesseract 실행 실패 ({type(exc).__name__}): {str(exc).splitlines()[0][:160]}"
-            # OSD is unreliable on Korean identity cards. Compare only local
-            # recognition confidence across rotations; never expose recognized text.
-            h, w = card.shape[:2]
-            # Do not enlarge OCR input: all tested scales chose the same
-            # orientation for the sample, while upscaling took longer. Cap
-            # only very large cards to keep OCR work bounded.
-            scale = min(1.0, 1400.0 / max(h, w))
-            enlarged = (cv2.resize(card, None, fx=scale, fy=scale,
-                                   interpolation=cv2.INTER_AREA)
-                        if scale < 1.0 else card)
-            scores: list[tuple[int, float, int]] = []
-            # The print format is landscape, so a portrait crop only needs the
-            # two rotations that make it landscape. A landscape crop compares
-            # its current orientation with the upside-down alternative.
-            if w >= h:
-                rotations = {
-                    0: enlarged,
-                    180: cv2.rotate(enlarged, cv2.ROTATE_180),
-                }
-            else:
-                rotations = {
-                    90: cv2.rotate(enlarged, cv2.ROTATE_90_CLOCKWISE),
-                    270: cv2.rotate(enlarged, cv2.ROTATE_90_COUNTERCLOCKWISE),
-                }
-            for degrees, candidate in rotations.items():
-                data = pytesseract.image_to_data(
-                    candidate, lang="kor", output_type=Output.DICT,
-                    config="--psm 6",
-                )
-                confidences = [float(conf) for conf, word in zip(data["conf"], data["text"])
-                               if word.strip() and float(conf) >= 0]
-                if confidences:
-                    average = sum(confidences) / len(confidences)
-                    scores.append((degrees, average, len(confidences)))
-                    if score_log is not None:
-                        score_log.append({"rotation_degrees": degrees,
-                                          "mean_confidence": average,
-                                          "recognized_token_count": len(confidences)})
-            scores.sort(key=lambda item: item[1], reverse=True)
-            if scores:
-                best = scores[0]
-                runner_up = scores[1][1] if len(scores) > 1 else 0.0
-                if best[1] >= 35.0 and best[2] >= 4 and best[1] - runner_up >= 12.0:
-                    return best[0], None
-            return None, "OCR 방향 점수 차이가 작아 회전 확인이 필요합니다."
-
-        if getattr(sys, "frozen", False):
-            return None, "패키지에 포함된 한국어 OCR 모델을 찾지 못했습니다. 다시 빌드해야 합니다."
-
-        data = pytesseract.image_to_osd(card, output_type=Output.DICT)
-        confidence = float(data.get("orientation_conf", 0))
-        rotation = int(data.get("rotate", 0)) % 360
-        if score_log is not None:
-            score_log.append({"osd_rotation_degrees": rotation,
-                              "orientation_confidence": confidence})
-        if rotation in (0, 90, 180, 270) and confidence >= 2.0:
-            return rotation, None
-        return None, "문자 방향 판별 신뢰도가 낮아 회전 확인이 필요합니다."
-    except Exception as exc:
-        detail = " ".join(str(exc).splitlines())[:160]
-        return None, f"Tesseract OCR 오류 ({type(exc).__name__}): {detail}"
-
-
-def _crop_to_print_aspect(card: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    """Center-crop symmetrically to the print ratio without stretching the card."""
-    target_w, target_h = PRINT_SIZE
-    h, w = card.shape[:2]
-    target_ratio = target_w / target_h
-    source_ratio = w / h
-    if source_ratio > target_ratio:
-        cropped_w = max(1, int(round(h * target_ratio)))
-        left = max(0, (w - cropped_w) // 2)
-        right = left + cropped_w
-        return card[:, left:right], (left, 0, cropped_w, h)
-    cropped_h = max(1, int(round(w / target_ratio)))
-    top = max(0, (h - cropped_h) // 2)
-    bottom = top + cropped_h
-    return card[top:bottom, :], (0, top, w, cropped_h)
-
-
-def _resize_to_print_size(card: np.ndarray) -> np.ndarray:
-    target_w, target_h = PRINT_SIZE
-    h, w = card.shape[:2]
-    shrinking = target_w < w or target_h < h
-    return cv2.resize(card, (target_w, target_h),
-                      interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_CUBIC)
-
-
-def _fit_print_size(card: np.ndarray) -> np.ndarray:
-    cropped, _ = _crop_to_print_aspect(card)
-    return _resize_to_print_size(cropped)
-
-
-def _save_crop_preview(card: np.ndarray, source: Path, destination: Path) -> Path:
-    """Save a card-only preview at print dimensions, even if OCR needs review."""
-    if card.shape[0] > card.shape[1]:
-        card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
-    preview = _fit_print_size(card)
-    path = destination / f"{source.stem}_crop_preview.jpg"
-    rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-    Image.fromarray(rgb).save(path, format="JPEG", quality=95, dpi=(300, 300), subsampling=0)
-    return path
-
-
-def process_image(
-    input_path: str | Path,
-    output_dir: str | Path,
-    *,
-    crop_mode: str = "perspective",
-    manual_rect: tuple[float, float, float, float, float] | None = None,
-) -> CropResult:
-    """Process one JPG/PNG. Uncertain detection or orientation never saves a final image."""
-    if crop_mode not in {"rectangle", "perspective"}:
-        return CropResult("failed", "지원하지 않는 크롭 모드입니다.")
+def _save_image(path: Path, image: np.ndarray, *, quality: int = 95) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(path, format="JPEG", quality=quality,
+                              dpi=(300, 300), subsampling=0)
+
+
+def _diagnostic_overlay(image: np.ndarray, quad: np.ndarray,
+                        crop_quad: np.ndarray) -> np.ndarray:
+    overlay = image.copy()
+    scale = max(1.0, image.shape[1] / 1400.0)
+    cv2.polylines(overlay, [quad.astype(np.int32).reshape(-1, 1, 2)], True,
+                  (0, 190, 255), max(2, round(scale * 2)))
+    cv2.polylines(overlay, [crop_quad.astype(np.int32).reshape(-1, 1, 2)], True,
+                  (0, 220, 0), max(2, round(scale * 2)))
+    for index, point in enumerate(crop_quad):
+        center = tuple(np.rint(point).astype(int))
+        cv2.circle(overlay, center, max(4, round(scale * 5)), (0, 0, 255), -1)
+        cv2.putText(overlay, str(index + 1), center, cv2.FONT_HERSHEY_SIMPLEX,
+                    max(0.6, scale * 0.8), (255, 255, 255), 2, cv2.LINE_AA)
+    return overlay
+
+
+def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
+    """Run id_card_crop's full detector, edge refinement, flattening and crop."""
     source = Path(input_path)
-    destination = Path(output_dir)
-    if source.suffix.lower() not in SUPPORTED_SUFFIXES:
-        return CropResult("failed", "JPG, JPEG, PNG 파일만 지원합니다.")
-    try:
-        image = _load_image(source)
-    except Exception:
-        return CropResult("failed", "이미지를 열 수 없습니다.")
-
+    destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
     debug_dir = destination / f"{source.stem}_debug"
-    if debug_dir.exists():
-        shutil.rmtree(debug_dir)
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    info: dict = {
-        "source_file": source.name,
-        "source_size_px": [int(image.shape[1]), int(image.shape[0])],
-        "status": "processing",
-        "ocr_text_saved": False,
-    }
-    _save_debug_image(debug_dir, "00_source.jpg", image)
-
-    detection: dict = {"crop_mode": crop_mode}
-    flattened_card = None
-    if manual_rect is not None:
-        rect = tuple(float(value) for value in manual_rect)
-        corners = _rect_corners(rect)
-        confidence = 1.0
-        detection.update(fit_mode="manual_rotated_rectangle",
-                         rectangle_parameters={"center_x": rect[0], "center_y": rect[1],
-                                               "width": rect[2], "height": rect[3],
-                                               "angle_degrees": rect[4]},
-                         outer_corners_xy=corners.tolist(), inner_corners_xy=corners.tolist())
-    else:
-        fullauto = None
-        if crop_mode == "perspective":
-            # Camera photos need an initial perspective flattening before the
-            # card edges can be measured reliably. The second rectification is
-            # used only to refine the four edge locations; final pixels are
-            # sampled once from the original image.
-            raw_quad, silhouette, detector_score = camera_flatten.find_card_quad(
-                image, return_score=True,
-            )
-            if raw_quad is not None:
-                edge_quad = camera_flatten.refine_quad_silhouette(
-                    image, raw_quad, silhouette,
-                )
-                initial_flat, _ = camera_flatten.rectify(
-                    image, camera_flatten.landscape_quad(edge_quad),
-                )
-                refined_quad = camera_flatten.flatten_and_refine(image, edge_quad)
-                refined_flat, _ = camera_flatten.rectify(image, refined_quad)
-                flattened_card, crop_quad = camera_flatten.crop_from_flat(
-                    image, refined_quad, PRINT_SIZE[0], PRINT_SIZE[1], 0.03,
-                )
-                corners = crop_quad
-                confidence = float(min(1.0, detector_score))
-                detection.update(
-                    fit_mode="flatten_then_refine_perspective_quad",
-                    detector_name="multi_mask_edge_contrast",
-                    detector_score=float(detector_score),
-                    initial_corners_xy=raw_quad.tolist(),
-                    silhouette_refined_corners_xy=edge_quad.tolist(),
-                    flattened_refined_corners_xy=refined_quad.tolist(),
-                    outer_corners_xy=refined_quad.tolist(),
-                    inner_corners_xy=crop_quad.tolist(),
-                    inset_fraction=0.03,
-                    flattening_iterations=2,
-                )
-                _save_debug_image(debug_dir, "01a_initial_flattening.jpg", initial_flat)
-                _save_debug_image(debug_dir, "01b_refined_flattening.jpg", refined_flat)
-                _save_debug_image(debug_dir, "01c_final_crop_from_original.jpg", flattened_card)
-                fullauto = "flattening_pipeline_used"
-        if fullauto == "flattening_pipeline_used":
-            pass
-        else:
-            fullauto = (_detect_fullauto_quad(image) if crop_mode == "perspective" else None)
-        if fullauto is not None and fullauto != "flattening_pipeline_used":
-            outer_quad, confidence, detector_details = fullauto
-            center = outer_quad.mean(axis=0)
-            corners = outer_quad + (center - outer_quad) * 0.016
-            detection.update(
-                detector_details,
-                crop_mode="perspective",
-                outer_corners_xy=outer_quad.tolist(),
-                inner_corners_xy=corners.tolist(),
-                perspective_inset_fraction=0.016,
-            )
-        elif fullauto is None:
-            corners, confidence = _candidate_contour(
-                image, detection, force_rectangle=False,
-            )
-        rect = None
-    component_mask = detection.pop("component_mask", None)
-    if (crop_mode == "rectangle" and corners is not None and manual_rect is None
-            and detection.get("fit_mode") in {"rotated_rectangle", "minimum_area_rectangle"}):
-        outer_corners = np.asarray(detection.get("outer_corners_xy", corners), dtype=np.float32)
-        initial_rect = detection.get("initial_rotated_rect") or _rect_from_corners(outer_corners)
-        if component_mask is not None:
-            rect = _refine_rotated_rect(component_mask, initial_rect, detection)
-        else:
-            rect = initial_rect
-        # Locate the point where every rounded corner enters card pixels, then
-        # use the deepest required inset on all four sides. Sharing one inset
-        # keeps the result a rectangle and avoids copying scanner background.
-        corner_details: dict = {}
-        if component_mask is not None:
-            _move_corners_inside_component(
-                component_mask, _rect_corners(rect), corner_details,
-            )
-        inset = float(corner_details.get("shared_inset_px", 0.0))
-        if inset <= 0:
-            # Threshold masks can miss a very pale card corner; keep a modest
-            # deterministic safety inset rather than risk a paper sliver.
-            inset = max(1.0, min(rect[3] * 0.025, 30.0))
-        rect = (rect[0], rect[1], max(2.0, rect[2] - 2 * inset),
-                max(2.0, rect[3] - 2 * inset), rect[4])
-        corners = _rect_corners(rect)
-        detection["rectangle_parameters"] = {
-            "center_x": rect[0], "center_y": rect[1], "width": rect[2],
-            "height": rect[3], "angle_degrees": rect[4], "inset_px_per_side": inset,
-        }
-        detection["rounded_corner_inset"] = corner_details
-        detection["inner_corners_xy"] = corners.tolist()
-    elif (corners is not None and detection.get("fit_mode") == "minimum_area_rectangle"
-          and manual_rect is None):
-        # If the four detected edges are genuinely parallel, refine one shared
-        # rotated rectangle against the card mask, then inset all sides evenly.
-        initial_rect = detection.get("initial_rotated_rect") or _rect_from_corners(corners)
-        rect = _refine_rotated_rect(component_mask, tuple(initial_rect), detection) \
-            if component_mask is not None else tuple(initial_rect)
-        corner_details: dict = {}
-        if component_mask is not None:
-            _move_corners_inside_component(
-                component_mask, _rect_corners(rect), corner_details,
-            )
-        inset = float(corner_details.get("shared_inset_px", 0.0))
-        if inset <= 0:
-            inset = max(1.0, min(rect[3] * 0.025, 30.0))
-        rect = (rect[0], rect[1], max(2.0, rect[2] - 2 * inset),
-                max(2.0, rect[3] - 2 * inset), rect[4])
-        corners = _rect_corners(rect)
-        detection["rectangle_parameters"] = {
-            "center_x": rect[0], "center_y": rect[1], "width": rect[2],
-            "height": rect[3], "angle_degrees": rect[4], "inset_px_per_side": inset,
-        }
-        detection["rounded_corner_inset"] = corner_details
-        detection["inner_corners_xy"] = corners.tolist()
-    elif (corners is not None and detection.get("fit_mode") == "fitted_edge_quad"
-          and manual_rect is None):
-        # Perspective skew is measured from the four fitted physical edges.
-        # Keep the quad slightly inside rounded corners, then rectify it to a
-        # true rectangle during the perspective warp.
-        outer_quad = corners.copy()
-        corner_details: dict = {}
-        inner_quad = (_move_corners_inside_component(
-            component_mask, outer_quad, corner_details,
-        ) if component_mask is not None else None)
-        if inner_quad is None:
-            edge_lengths = [float(np.linalg.norm(outer_quad[(i + 1) % 4] - outer_quad[i]))
-                            for i in range(4)]
-            inset = max(1.0, min(min(edge_lengths) * 0.02, 24.0))
-            inner_quad = _inset_quad_uniform(outer_quad, inset)
-            corner_details["shared_inset_px"] = inset
-        corners = inner_quad
-        detection["outer_corners_xy"] = outer_quad.tolist()
-        detection["inner_corners_xy"] = corners.tolist()
-        detection["rounded_corner_inset"] = corner_details
-    info["detection"] = {key: value for key, value in detection.items()}
-    info["detection_confidence"] = confidence
-    if "outer_corners_xy" in detection:
-        outer = np.asarray(detection["outer_corners_xy"], dtype=np.float32)
-        _save_debug_image(debug_dir, "01_outer_candidate_points.jpg",
-                          _draw_debug_corners(image, outer, (0, 180, 255)))
-    if corners is not None:
-        _save_debug_image(debug_dir, "02_inner_crop_points.jpg",
-                          _draw_debug_corners(image, corners, (0, 200, 0)))
-    if component_mask is not None:
-        _save_debug_image(debug_dir, "03_selected_component_mask.png", component_mask)
-
-    card = flattened_card
-    if crop_mode == "rectangle" and rect is not None and confidence >= 0.42:
-        edge = corners[1] - corners[0]
-        info["deskew_angle_degrees"] = float(np.degrees(np.arctan2(edge[1], edge[0])))
-        info["deskewed_size_px"] = [int(rect[2]), int(rect[3])]
-        info["deskewed_corners_xy"] = corners
-        card = _rectified_crop(image, rect, info)
-        _save_debug_image(debug_dir, "04_rotated_rectangle_crop.jpg", card)
-    elif card is None and corners is not None and confidence >= 0.42:
-        edge = corners[1] - corners[0]
-        info["deskew_angle_degrees"] = float(np.degrees(np.arctan2(edge[1], edge[0])))
-        image, corners = _deskew_scan(image, corners)
-        info["deskewed_size_px"] = [int(image.shape[1]), int(image.shape[0])]
-        info["deskewed_corners_xy"] = corners
-        _save_debug_image(debug_dir, "04_deskewed_points.jpg",
-                          _draw_debug_corners(image, corners, (0, 200, 0)))
-
-    diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
-    diagnostic = image.copy()
-    if corners is not None:
-        diagnostic = _draw_debug_corners(diagnostic, corners, (0, 200, 0))
-    Image.fromarray(cv2.cvtColor(diagnostic, cv2.COLOR_BGR2RGB)).save(diagnostic_path, quality=92)
-
-    flattening_detection = detection.get("fit_mode") == "flatten_then_refine_perspective_quad"
-    if corners is None or (confidence < 0.42 and not flattening_detection):
-        info.update(status="manual_review", message="카드 외곽을 확실하게 검출하지 못했습니다.")
-        _write_debug_log(debug_dir, info)
-        return CropResult("manual_review", "카드 외곽을 확실하게 검출하지 못했습니다.",
-                          diagnostic_path=diagnostic_path, confidence=confidence,
-                          debug_dir=debug_dir, rectangle=rect)
-    if card is None:
-        try:
-            card = _warp(image, corners, info)
-        except Exception:
-            info.update(status="manual_review", message="원근 보정에 실패했습니다.")
-            _write_debug_log(debug_dir, info)
-            return CropResult("manual_review", "원근 보정에 실패했습니다.",
-                              diagnostic_path=diagnostic_path, confidence=confidence,
-                              debug_dir=debug_dir, rectangle=rect)
-
-    info["warped_card_size_px"] = [int(card.shape[1]), int(card.shape[0])]
-    _save_debug_image(debug_dir, "05_warped_card_before_orientation.jpg", card)
-
-    rotation_scores: list[dict] = []
-    rotation, orientation_warning = _read_rotation(card, rotation_scores)
-    info["ocr_rotation_scores"] = rotation_scores
-    info["ocr_selected_rotation_degrees"] = rotation
-    if rotation is None:
-        preview_path = _save_crop_preview(card, source, destination)
-        preview = _load_image(preview_path)
-        _save_debug_image(debug_dir, "06_orientation_review_preview.jpg", preview)
-        info.update(status="manual_review", message=orientation_warning or "방향을 확인해야 합니다.",
-                    preview_path=preview_path)
-        _write_debug_log(debug_dir, info)
-        return CropResult("manual_review", orientation_warning or "방향을 확인해야 합니다.",
-                          diagnostic_path=diagnostic_path, confidence=confidence,
-                          preview_path=preview_path, debug_dir=debug_dir, rectangle=rect)
-    applied_rotation = rotation or 0
-    if applied_rotation == 90:
-        card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
-    elif applied_rotation == 180:
-        card = cv2.rotate(card, cv2.ROTATE_180)
-    elif applied_rotation == 270:
-        card = cv2.rotate(card, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    # Landscape print dimensions; rotate portrait cards to landscape without altering content.
-    if card.shape[0] > card.shape[1]:
-        card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
-    info["upright_card_size_px"] = [int(card.shape[1]), int(card.shape[0])]
-    _save_debug_image(debug_dir, "06_upright_card_before_resize.jpg", card)
-    aspect_cropped, aspect_crop_bounds = _crop_to_print_aspect(card)
-    info["print_aspect_crop_bounds_xywh"] = list(aspect_crop_bounds)
-    info["print_aspect_crop_size_px"] = [int(aspect_cropped.shape[1]), int(aspect_cropped.shape[0])]
-    _save_debug_image(debug_dir, "07_print_aspect_crop.jpg", aspect_cropped)
-    warning = None
-    if min(card.shape[:2]) < 602:
-        warning = "원본 카드 해상도가 낮아 확대 출력 시 선명도가 제한됩니다."
-    final = _resize_to_print_size(aspect_cropped)
     output_path = destination / f"{source.stem}_8.1x5.1cm.jpg"
-    rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
-    Image.fromarray(rgb).save(output_path, format="JPEG", quality=95, dpi=(300, 300), subsampling=0)
-    info.update(status="complete", message="보정 및 인화 규격 변환이 완료되었습니다.",
-                quality_warning=warning, output_path=output_path,
-                print_size_px=list(PRINT_SIZE), output_dpi=300)
-    _save_debug_image(debug_dir, "08_final_8.1x5.1cm.jpg", final)
-    _write_debug_log(debug_dir, info)
-    return CropResult("complete", "보정 및 인화 규격 변환이 완료되었습니다.", output_path,
-                      diagnostic_path, confidence, applied_rotation, warning,
-                      debug_dir=debug_dir, rectangle=rect)
+    diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
+    info = {
+        "source": str(source),
+        "algorithm": "id_card_crop.process_image_data",
+        "target_cm": [8.1, 5.1],
+        "dpi": 300,
+        "shrink_fraction": 0.03,
+    }
+
+    try:
+        image = _load_image(source)
+        result = card_algorithm.process_image_data(
+            image, source_path=source, dpi=300, shrink=0.03, verbose=False,
+        )
+        if result is None:
+            info.update(status="manual_review", message="신분증 외곽을 찾지 못했습니다.")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            _save_image(debug_dir / "00_source.jpg", image)
+            (debug_dir / "run.json").write_text(
+                json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            return CropResult("manual_review", info["message"],
+                              diagnostic_path=diagnostic_path, debug_dir=debug_dir)
+
+        quad = np.asarray(result["quad"], dtype=np.float32)
+        crop_quad = np.asarray(result["crop_quad"], dtype=np.float32)
+        corrected = result["image"]
+        _save_image(output_path, corrected, quality=100)
+        _save_image(diagnostic_path, _diagnostic_overlay(image, quad, crop_quad))
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        _save_image(debug_dir / "00_source.jpg", image)
+        _save_image(debug_dir / "01_card_boundary_and_crop.jpg",
+                    _diagnostic_overlay(image, quad, crop_quad))
+        _save_image(debug_dir / "02_final.jpg", corrected, quality=100)
+
+        warning = None
+        if min(image.shape[:2]) < min(PRINT_SIZE):
+            warning = "원본 해상도가 낮아 확대 출력 시 선명도가 제한될 수 있습니다."
+        info.update(
+            status="complete",
+            message="id_card_crop 알고리즘으로 보정했습니다.",
+            confidence=float(result["confidence"]),
+            rotation=int(result["rotation"]),
+            source_size_px=[int(image.shape[1]), int(image.shape[0])],
+            output_size_px=[int(corrected.shape[1]), int(corrected.shape[0])],
+            output_path=str(output_path),
+            outer_corners_xy=quad.tolist(),
+            crop_corners_xy=crop_quad.tolist(),
+            quality_warning=warning,
+        )
+        (debug_dir / "run.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        return CropResult("complete", info["message"], output_path,
+                          diagnostic_path, float(result["confidence"]),
+                          int(result["rotation"]), warning, debug_dir=debug_dir)
+    except (OSError, ValueError, cv2.error) as exc:
+        info.update(status="failed", message=str(exc))
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        (debug_dir / "run.json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        return CropResult("failed", f"이미지 처리 실패: {exc}",
+                          debug_dir=debug_dir)
+
+
+def _image_metrics(image: np.ndarray) -> dict:
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    low, median, high = np.percentile(lab[:, :, 0], [1, 50, 99])
+    lightness_p10, lightness_p90 = np.percentile(lab[:, :, 0], [10, 90])
+    saturation_p50, saturation_p90, saturation_p99 = np.percentile(
+        hsv[:, :, 1], [50, 90, 99],
+    )
+    return {
+        "lightness_mean": round(float(lab[:, :, 0].mean()), 2),
+        "lightness_p01_p50_p99": [round(float(v), 2) for v in (low, median, high)],
+        "lightness_p10_p90": [round(float(lightness_p10), 2), round(float(lightness_p90), 2)],
+        "saturation_mean": round(float(hsv[:, :, 1].mean()), 2),
+        "saturation_p50_p90_p99": [
+            round(float(v), 2) for v in (saturation_p50, saturation_p90, saturation_p99)
+        ],
+        "laplacian_variance": round(float(cv2.Laplacian(gray, cv2.CV_64F).var()), 2),
+    }
+
+
+# Numeric before/after profiles from examples that were meaningfully edited.
+# The first pair was effectively unchanged and is used as the no-op case.
+# Only measurements are retained; no source ID photographs are embedded.
+_PAIR_PERCENTILES = np.array(
+    [0.5, 1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 99.5],
+    dtype=np.float32,
+)
+_PAIR_LIGHTNESS_TARGET = np.array(
+    [0, 0, 0, 0, 23, 122, 162, 185, 202, 215, 227, 239, 250, 255, 255, 255],
+    dtype=np.float32,
+)
+_PAIR3_LIGHTNESS_TARGET = np.array(
+    [0, 0, 0, 1, 6, 93, 152, 178, 196, 209, 220, 230, 242, 249, 254, 255],
+    dtype=np.float32,
+)
+_PHOTO_LIGHTNESS_TARGET = np.array(
+    [1, 2, 9, 17, 33, 99, 160, 185, 204, 220, 234, 244, 251, 253, 255, 255],
+    dtype=np.float32,
+)
+_CALIBRATION_INPUTS = np.array([
+    # lightness mean, p10, p50, p90, saturation mean
+    [158.5, 41, 176, 222, 69.4],  # 비포2
+    [164.1, 42, 187, 225, 51.2],  # 비포3
+    [130.34, 41, 145, 182, 51.5],  # photo source
+], dtype=np.float32)
+_CALIBRATION_OUTPUTS = np.stack([
+    _PAIR_LIGHTNESS_TARGET,
+    _PAIR3_LIGHTNESS_TARGET,
+    _PHOTO_LIGHTNESS_TARGET,
+])
+_CALIBRATION_SATURATION_GAINS = np.array([1.3602, 1.5160, 1.3612], dtype=np.float32)
+_CALIBRATION_FEATURE_SCALES = np.array([15, 15, 25, 30, 15], dtype=np.float32)
+
+
+def _select_pair_profile(metrics: dict) -> tuple[np.ndarray, float, list[float]]:
+    """Interpolate the closest human-edited pair profiles for this input."""
+    p10, p50, p90 = metrics["lightness_p10_p90"][0], \
+        metrics["lightness_p01_p50_p99"][1], metrics["lightness_p10_p90"][1]
+    features = np.array([
+        metrics["lightness_mean"], p10, p50, p90, metrics["saturation_mean"],
+    ], dtype=np.float32)
+    distances = np.sum(
+        ((_CALIBRATION_INPUTS - features) / _CALIBRATION_FEATURE_SCALES) ** 2,
+        axis=1,
+    )
+    weights = np.exp(-distances / (2.0 * 0.75 ** 2))
+    weights /= max(float(weights.sum()), 1e-12)
+    output_profile = weights @ _CALIBRATION_OUTPUTS
+    saturation_gain = float(weights @ _CALIBRATION_SATURATION_GAINS)
+    return output_profile.astype(np.float32), saturation_gain, [
+        round(float(v), 5) for v in weights
+    ]
+
+
+def _paired_levels_lut(lightness: np.ndarray, target_profile: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Build a pointwise Levels curve from this image to its paired profile."""
+    source_points = np.percentile(lightness, _PAIR_PERCENTILES).astype(np.float32)
+    target_points = np.maximum.accumulate(target_profile)
+
+    x_points = np.concatenate(([0.0], source_points, [255.0]))
+    y_points = np.concatenate(([0.0], target_points, [255.0]))
+    # Quantized/flat images can repeat percentile input values. Merge such
+    # anchors without creating a backwards or discontinuous tone curve.
+    unique_x: list[float] = []
+    unique_y: list[float] = []
+    for x_value, y_value in zip(x_points, y_points):
+        if unique_x and x_value <= unique_x[-1]:
+            unique_y[-1] = max(unique_y[-1], float(y_value))
+        else:
+            unique_x.append(float(x_value))
+            unique_y.append(float(y_value))
+    unique_y = np.maximum.accumulate(np.asarray(unique_y, dtype=np.float32)).tolist()
+    lut = np.interp(np.arange(256), unique_x, unique_y)
+    lut = np.clip(np.maximum.accumulate(lut), 0, 255).astype(np.uint8)
+    details = {
+        "input_percentiles": [float(v) for v in _PAIR_PERCENTILES],
+        "input_levels": [round(float(v), 2) for v in source_points],
+        "output_levels": [round(float(v), 2) for v in target_points],
+        "black_input_level": round(float(source_points[4]), 2),
+        "midtone_input_level": round(float(source_points[8]), 2),
+        "white_input_level": round(float(source_points[14]), 2),
+    }
+    return lut[lightness], details
+
+
+def _scale_lab_chroma_to_mean(image: np.ndarray, target_saturation: float) -> tuple[np.ndarray, float]:
+    """Increase color while retaining the Levels-adjusted lightness channel."""
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    original_a, original_b = lab[:, :, 1].copy(), lab[:, :, 2].copy()
+
+    def render(gain: float) -> np.ndarray:
+        candidate = lab.copy()
+        candidate[:, :, 1] = np.clip(128 + (original_a - 128) * gain, 0, 255)
+        candidate[:, :, 2] = np.clip(128 + (original_b - 128) * gain, 0, 255)
+        return cv2.cvtColor(candidate.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    low_gain, high_gain = 0.5, 3.0
+    for _ in range(18):
+        gain = (low_gain + high_gain) / 2.0
+        candidate = render(gain)
+        measured = float(cv2.cvtColor(candidate, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+        if measured < target_saturation:
+            low_gain = gain
+        else:
+            high_gain = gain
+    gain = (low_gain + high_gain) / 2.0
+    return render(gain), gain
+
+
+def _auto_enhance_card(image: np.ndarray) -> tuple[np.ndarray, dict]:
+    """Apply a learned Levels curve and restrained chroma from manual examples."""
+    image = np.uint8(np.clip(image, 0, 255))
+    before = _image_metrics(image)
+    lightness_low, _, lightness_high = before["lightness_p01_p50_p99"]
+    saturation_mean = before["saturation_mean"]
+    contrast_span = lightness_high - lightness_low
+
+    # The first before/after pair changed negligibly. Keep images with a healthy
+    # tonal range untouched; use the other two pairs only for visibly weak input.
+    needs_enhancement = (
+        before["lightness_mean"] < 166.0
+        or saturation_mean < 58.0
+        or contrast_span < 230.0
+    )
+    log: list[str] = []
+    lightness_curve = None
+    chroma_gain = 1.0
+    target_saturation_mean = saturation_mean
+
+    if needs_enhancement:
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        lightness, channel_a, channel_b = cv2.split(lab)
+        target_profile, saturation_gain, profile_weights = _select_pair_profile(before)
+        corrected_l, lightness_curve = _paired_levels_lut(lightness, target_profile)
+        leveled = cv2.cvtColor(cv2.merge([corrected_l, channel_a, channel_b]),
+                               cv2.COLOR_LAB2BGR)
+        log.append("paired_levels_curve")
+
+        # The manual examples' color increase is best represented by their
+        # median before/after saturation ratio. Apply it in LAB chroma so the
+        # Levels-adjusted lightness does not collapse as it did with HSV scaling.
+        target_saturation_mean = min(saturation_mean * saturation_gain, 110.0)
+        enhanced, chroma_gain = _scale_lab_chroma_to_mean(
+            leveled, target_saturation_mean,
+        )
+        log.append("paired_chroma_gain")
+    else:
+        # The lightly edited first pair is the reference behavior for good input.
+        enhanced = image.copy()
+        log.append("quality_already_adequate_noop")
+
+    details = {
+        "method": "paired_before_after_percentile_transfer",
+        "input_scope": "selected_image",
+        "metrics_before": before,
+        "metrics_after": _image_metrics(enhanced),
+        "quality_triggered": needs_enhancement,
+        "actions": log,
+        "calibration": {
+            "meaningfully_edited_pairs": [
+                "비포2→애프터2", "비포3→애프터3", "photo→애프타",
+            ],
+            "near_noop_pair": "비포1→애프터1",
+            "percentiles": [float(v) for v in _PAIR_PERCENTILES],
+            "profile_weights": profile_weights if needs_enhancement else [0, 0, 0],
+            "selected_lightness_after_profile": [float(v) for v in target_profile]
+            if needs_enhancement else None,
+            "source_images_embedded": False,
+        },
+        "applied": {
+            "correction_triggered": needs_enhancement,
+            "saturation_mean_before": round(saturation_mean, 2),
+            "saturation_mean_target": round(target_saturation_mean, 2),
+            "lab_chroma_gain": round(float(chroma_gain), 4),
+            "lightness_curve": lightness_curve,
+        },
+    }
+    return enhanced, details
+
+
+def enhance_for_recognition(input_path: str | Path,
+                            output_path: str | Path,
+                            original_path: str | Path | None = None) -> tuple[Path, dict]:
+    """Apply recognition-oriented tonal corrections without detecting or cropping."""
+    source = Path(original_path) if original_path else Path(input_path)
+    destination = Path(output_path)
+    image = _load_image(source)
+    enhanced, details = _auto_enhance_card(image)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
+    Image.fromarray(rgb).save(destination, format="JPEG", quality=98,
+                              dpi=(RECOGNITION_DPI, RECOGNITION_DPI), subsampling=0)
+    details.update({
+        "input_scope": "selected_input_without_additional_crop",
+        "source_image": str(source),
+        "source_size_px": [int(image.shape[1]), int(image.shape[0])],
+        "output_size_px": [int(enhanced.shape[1]), int(enhanced.shape[0])],
+        "output_dpi": RECOGNITION_DPI,
+        "dpi_is_metadata_only": True,
+        "spatial_processing": "none: original dimensions retained, no crop, rotation, or rescale",
+    })
+    return destination, details

@@ -22,6 +22,9 @@ gui = ["PySide6>=6.6"]
 idcard-crop = "idcard_cropper.cli:main"
 idcard-crop-gui = "idcard_cropper.gui:main"
 
+[tool.setuptools]
+py-modules = ["id_card_crop"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
