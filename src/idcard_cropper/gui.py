@@ -74,8 +74,12 @@ def _c_size_for_printer(printer: QPrinter) -> QPageSize:
         if abs(max(size.width(), size.height()) - 86.0) <= 0.5 and abs(
             min(size.width(), size.height()) - 54.0
         ) <= 0.5:
-            return supported_size
-    return QPageSize(QSizeF(86.0, 54.0), QPageSize.Unit.Millimeter, "C Size")
+            # QPageLayout applies Landscape by rotating its portrait base size.
+            # Normalize driver entries that report C already as 86x54; otherwise
+            # applying Landscape a second time can produce a 54x86 page.
+            return QPageSize(QSizeF(54.0, 86.0), QPageSize.Unit.Millimeter,
+                             supported_size.name())
+    return QPageSize(QSizeF(54.0, 86.0), QPageSize.Unit.Millimeter, "C Size")
 
 
 def _set_c_landscape_default(printer: QPrinter) -> None:
@@ -710,7 +714,7 @@ class MainWindow(QMainWindow):
         form.addRow("프린터", printer_combo)
         form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
         form.addRow("방향", QLabel("가로"))
-        form.addRow("인쇄 크기", QLabel("8.1 × 5.1 cm · 300 DPI"))
+        form.addRow("인쇄 영역", QLabel("C 용지 전체 채움 (86 × 54 mm)"))
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
         preferences_button.clicked.connect(
@@ -737,26 +741,32 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(result.output_path.stem)
 
-        # Print the 81 x 51 mm card at its physical size, centered on the
-        # selected C-size page. The selected media/orientation are deliberately
-        # reapplied for every job because Canon driver preferences are per-PC.
+        # Fill the complete 86 x 54 mm C-size sheet. The saved JPG is 81 x 51 mm;
+        # it is scaled to the paper edges here so the print has no app-added
+        # white border. The selected media/orientation are reapplied each job.
         printer.setFullPage(True)
+        paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
-        px_per_mm = printer.resolution() / 25.4
-        card_w = 81.0 * px_per_mm
-        card_h = 51.0 * px_per_mm
-        if page.width() < card_w or page.height() < card_h:
+        paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
+        is_c_landscape = (
+            abs(paper_mm.width() - 86.0) <= 0.5
+            and abs(paper_mm.height() - 54.0) <= 0.5
+        )
+        if not is_c_landscape or paper.width() <= 0 or paper.height() <= 0:
             self._write_print_log(result, {
-                "status": "rejected_page_too_small",
+                "status": "wrong_paper_size_or_orientation",
                 "printer_name": printer.printerName(),
+                "reported_paper_rect_mm": [paper_mm.x(), paper_mm.y(),
+                                            paper_mm.width(), paper_mm.height()],
+                "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
                 "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
                 "printer_resolution_dpi": printer.resolution(),
-                "required_card_mm": [81.0, 51.0],
             })
             QMessageBox.warning(
-                self, "용지 크기 확인",
-                "선택한 용지가 8.1 × 5.1cm 인쇄 영역보다 작습니다.\n"
-                "프린터 설정에서 SELPHY 카드 크기 또는 더 큰 용지를 선택하세요.",
+                self, "용지 방향 확인",
+                "프린터가 86 × 54mm C 용지 가로 방향을 적용하지 않았습니다.\n"
+                f"프린터가 보고한 크기: {paper_mm.width():.1f} × {paper_mm.height():.1f}mm\n"
+                "SELPHY 드라이버에서 C 용지와 가로 방향을 선택하고 다시 인쇄하세요.",
             )
             return
 
@@ -768,9 +778,7 @@ class MainWindow(QMainWindow):
             })
             QMessageBox.critical(self, "인쇄 오류", "보정 이미지를 열 수 없습니다.")
             return
-        target = QRectF(page.x() + (page.width() - card_w) / 2,
-                        page.y() + (page.height() - card_h) / 2,
-                        card_w, card_h)
+        target = QRectF(paper)
         painter = QPainter()
         if not painter.begin(printer):
             state = printer.printerState()
@@ -791,13 +799,16 @@ class MainWindow(QMainWindow):
             "printer_name": printer.printerName(),
             "printer_state": state.name,
             "painter_end": ended,
+            "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
             "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
             "target_rect_px": [target.x(), target.y(), target.width(), target.height()],
             "printer_resolution_dpi": printer.resolution(),
             "page_size_mm": [86.0, 54.0],
+            "reported_paper_size_mm": [paper_mm.width(), paper_mm.height()],
             "media": "C card (54 x 86 mm)",
             "orientation": "landscape",
-            "card_size_mm": [81.0, 51.0],
+            "image_target_mm": [86.0, 54.0],
+            "layout": "fill_entire_paper",
         })
         if not succeeded:
             QMessageBox.critical(
