@@ -1028,7 +1028,7 @@ def process_image(
             raw_quad, silhouette, detector_score = camera_flatten.find_card_quad(
                 image, return_score=True,
             )
-            if raw_quad is not None and detector_score >= 0.18:
+            if raw_quad is not None:
                 edge_quad = camera_flatten.refine_quad_silhouette(
                     image, raw_quad, silhouette,
                 )
@@ -1188,7 +1188,8 @@ def process_image(
         diagnostic = _draw_debug_corners(diagnostic, corners, (0, 200, 0))
     Image.fromarray(cv2.cvtColor(diagnostic, cv2.COLOR_BGR2RGB)).save(diagnostic_path, quality=92)
 
-    if corners is None or confidence < 0.42:
+    flattening_detection = detection.get("fit_mode") == "flatten_then_refine_perspective_quad"
+    if corners is None or (confidence < 0.42 and not flattening_detection):
         info.update(status="manual_review", message="카드 외곽을 확실하게 검출하지 못했습니다.")
         _write_debug_log(debug_dir, info)
         return CropResult("manual_review", "카드 외곽을 확실하게 검출하지 못했습니다.",
