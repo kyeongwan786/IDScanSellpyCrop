@@ -11,6 +11,7 @@ import sys
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
+from . import flattening as camera_flatten
 
 
 PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
@@ -1007,6 +1008,7 @@ def process_image(
     _save_debug_image(debug_dir, "00_source.jpg", image)
 
     detection: dict = {"crop_mode": crop_mode}
+    flattened_card = None
     if manual_rect is not None:
         rect = tuple(float(value) for value in manual_rect)
         corners = _rect_corners(rect)
@@ -1017,8 +1019,50 @@ def process_image(
                                                "angle_degrees": rect[4]},
                          outer_corners_xy=corners.tolist(), inner_corners_xy=corners.tolist())
     else:
-        fullauto = (_detect_fullauto_quad(image) if crop_mode == "perspective" else None)
-        if fullauto is not None:
+        fullauto = None
+        if crop_mode == "perspective":
+            # Camera photos need an initial perspective flattening before the
+            # card edges can be measured reliably. The second rectification is
+            # used only to refine the four edge locations; final pixels are
+            # sampled once from the original image.
+            raw_quad, silhouette, detector_score = camera_flatten.find_card_quad(
+                image, return_score=True,
+            )
+            if raw_quad is not None and detector_score >= 0.18:
+                edge_quad = camera_flatten.refine_quad_silhouette(
+                    image, raw_quad, silhouette,
+                )
+                initial_flat, _ = camera_flatten.rectify(
+                    image, camera_flatten.landscape_quad(edge_quad),
+                )
+                refined_quad = camera_flatten.flatten_and_refine(image, edge_quad)
+                refined_flat, _ = camera_flatten.rectify(image, refined_quad)
+                flattened_card, crop_quad = camera_flatten.crop_from_flat(
+                    image, refined_quad, PRINT_SIZE[0], PRINT_SIZE[1], 0.03,
+                )
+                corners = crop_quad
+                confidence = float(min(1.0, detector_score))
+                detection.update(
+                    fit_mode="flatten_then_refine_perspective_quad",
+                    detector_name="multi_mask_edge_contrast",
+                    detector_score=float(detector_score),
+                    initial_corners_xy=raw_quad.tolist(),
+                    silhouette_refined_corners_xy=edge_quad.tolist(),
+                    flattened_refined_corners_xy=refined_quad.tolist(),
+                    outer_corners_xy=refined_quad.tolist(),
+                    inner_corners_xy=crop_quad.tolist(),
+                    inset_fraction=0.03,
+                    flattening_iterations=2,
+                )
+                _save_debug_image(debug_dir, "01a_initial_flattening.jpg", initial_flat)
+                _save_debug_image(debug_dir, "01b_refined_flattening.jpg", refined_flat)
+                _save_debug_image(debug_dir, "01c_final_crop_from_original.jpg", flattened_card)
+                fullauto = "flattening_pipeline_used"
+        if fullauto == "flattening_pipeline_used":
+            pass
+        else:
+            fullauto = (_detect_fullauto_quad(image) if crop_mode == "perspective" else None)
+        if fullauto is not None and fullauto != "flattening_pipeline_used":
             outer_quad, confidence, detector_details = fullauto
             center = outer_quad.mean(axis=0)
             corners = outer_quad + (center - outer_quad) * 0.016
@@ -1029,7 +1073,7 @@ def process_image(
                 inner_corners_xy=corners.tolist(),
                 perspective_inset_fraction=0.016,
             )
-        else:
+        elif fullauto is None:
             corners, confidence = _candidate_contour(
                 image, detection, force_rectangle=False,
             )
@@ -1121,7 +1165,7 @@ def process_image(
     if component_mask is not None:
         _save_debug_image(debug_dir, "03_selected_component_mask.png", component_mask)
 
-    card = None
+    card = flattened_card
     if crop_mode == "rectangle" and rect is not None and confidence >= 0.42:
         edge = corners[1] - corners[0]
         info["deskew_angle_degrees"] = float(np.degrees(np.arctan2(edge[1], edge[0])))
@@ -1129,7 +1173,7 @@ def process_image(
         info["deskewed_corners_xy"] = corners
         card = _rectified_crop(image, rect, info)
         _save_debug_image(debug_dir, "04_rotated_rectangle_crop.jpg", card)
-    elif corners is not None and confidence >= 0.42:
+    elif card is None and corners is not None and confidence >= 0.42:
         edge = corners[1] - corners[0]
         info["deskew_angle_degrees"] = float(np.degrees(np.arctan2(edge[1], edge[0])))
         image, corners = _deskew_scan(image, corners)
