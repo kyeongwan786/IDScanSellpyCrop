@@ -41,6 +41,10 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 USER_ROLE = int(Qt.ItemDataRole.UserRole)
 SETTINGS_ORGANIZATION = "IDCardCropper"
 SETTINGS_APPLICATION = "IDCardCropper"
+DM_OUT_BUFFER = 0x00000002
+DM_IN_PROMPT = 0x00000004
+DM_IN_BUFFER = 0x00000008
+IDOK = 1
 
 
 def _preferred_printer_name() -> str:
@@ -76,6 +80,65 @@ def _c_size_for_printer(printer: QPrinter) -> QPageSize:
 def _set_c_landscape_default(printer: QPrinter) -> None:
     printer.setPageSize(_c_size_for_printer(printer))
     printer.setPageOrientation(QPageLayout.Orientation.Landscape)
+
+
+def _save_windows_printer_preferences(printer_name: str, parent_window: int) -> bool:
+    """Show the driver's property sheet and save its DEVMODE as this user's default."""
+    if sys.platform != "win32":
+        raise OSError("Windows 프린터 드라이버 설정은 Windows에서만 저장할 수 있습니다.")
+
+    import ctypes
+    from ctypes import wintypes
+
+    winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    handle = wintypes.HANDLE()
+    winspool.OpenPrinterW.argtypes = [
+        wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), wintypes.LPVOID,
+    ]
+    winspool.OpenPrinterW.restype = wintypes.BOOL
+    winspool.ClosePrinter.argtypes = [wintypes.HANDLE]
+    winspool.ClosePrinter.restype = wintypes.BOOL
+    winspool.DocumentPropertiesW.argtypes = [
+        wintypes.HWND, wintypes.HANDLE, wintypes.LPWSTR,
+        wintypes.LPVOID, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    winspool.DocumentPropertiesW.restype = wintypes.LONG
+    winspool.SetPrinterW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+    ]
+    winspool.SetPrinterW.restype = wintypes.BOOL
+
+    if not winspool.OpenPrinterW(printer_name, ctypes.byref(handle), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size = winspool.DocumentPropertiesW(None, handle, printer_name, None, None, 0)
+        if size <= 0:
+            raise OSError("프린터 드라이버 설정 크기를 가져오지 못했습니다.")
+
+        defaults = ctypes.create_string_buffer(size)
+        result = winspool.DocumentPropertiesW(
+            None, handle, printer_name, defaults, None, DM_OUT_BUFFER,
+        )
+        if result < 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        configured = ctypes.create_string_buffer(size)
+        result = winspool.DocumentPropertiesW(
+            wintypes.HWND(parent_window), handle, printer_name,
+            configured, defaults, DM_OUT_BUFFER | DM_IN_PROMPT | DM_IN_BUFFER,
+        )
+        if result != IDOK:  # IDCANCEL leaves the saved defaults untouched.
+            return False
+
+        class PrinterInfo9(ctypes.Structure):
+            _fields_ = [("pDevMode", wintypes.LPVOID)]
+
+        info = PrinterInfo9(ctypes.cast(configured, wintypes.LPVOID))
+        if not winspool.SetPrinterW(handle, 9, ctypes.byref(info), 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return True
+    finally:
+        winspool.ClosePrinter(handle)
 
 
 class Preview(QLabel):
@@ -541,6 +604,12 @@ class MainWindow(QMainWindow):
         form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
         form.addRow("방향", QLabel("가로"))
         form.addRow("인쇄 크기", QLabel("8.1 × 5.1 cm · 300 DPI"))
+        preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
+        preferences_button.setVisible(sys.platform == "win32")
+        preferences_button.clicked.connect(
+            lambda: self.save_printer_preferences(printer_combo.currentText(), dialog),
+        )
+        form.addRow(preferences_button)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Print | QDialogButtonBox.StandardButton.Cancel,
             parent=dialog,
@@ -631,6 +700,25 @@ class MainWindow(QMainWindow):
             )
             return
         self.status.setText("인쇄 작업을 프린터로 보냈습니다. 프린터 드라이버에서 카드 용지와 테두리 설정을 확인하세요.")
+
+    def save_printer_preferences(self, printer_name: str, parent: QDialog) -> None:
+        if not printer_name:
+            return
+        try:
+            saved = _save_windows_printer_preferences(printer_name, int(parent.winId()))
+        except OSError as exc:
+            QMessageBox.warning(parent, "프린터 설정 저장 실패", str(exc))
+            return
+        if not saved:
+            return
+        settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+        settings.setValue("printing/last_printer", printer_name)
+        settings.sync()
+        QMessageBox.information(
+            parent, "프린터 설정 저장 완료",
+            "선택한 SELPHY 드라이버 설정을 현재 Windows 사용자 기본값으로 저장했습니다. "
+            "다음 인쇄부터 이 설정이 적용됩니다.",
+        )
 
     @staticmethod
     def _write_print_log(result: CropResult, info: dict) -> None:
