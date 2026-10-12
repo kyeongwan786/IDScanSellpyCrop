@@ -456,7 +456,9 @@ class MainWindow(QMainWindow):
         self.print_button.clicked.connect(self.print_selected)
         self.open_diagnostics_button.clicked.connect(self.open_diagnostics)
         self.open_output_button.clicked.connect(self.open_output)
-        self.print_button.setEnabled(False)
+        # Keep this actionable even before processing so a click can explain
+        # why there is no printable result instead of appearing unresponsive.
+        self.print_button.setEnabled(True)
         self.open_diagnostics_button.setEnabled(False)
         self.manual_apply_button.setEnabled(False)
 
@@ -625,7 +627,6 @@ class MainWindow(QMainWindow):
         else:
             self.source_preview.load_source(None)
             self.result_preview.show_image(None)
-            self.print_button.setEnabled(False)
             self.open_diagnostics_button.setEnabled(False)
 
     def display_path(self, path: Path) -> None:
@@ -634,13 +635,11 @@ class MainWindow(QMainWindow):
         if result:
             self.result_preview.show_image(result.output_path or result.preview_path)
             self.source_preview.set_rectangle(result.rectangle)
-            self.print_button.setEnabled(bool(result.output_path and result.output_path.is_file()))
             self.open_diagnostics_button.setEnabled(bool(result.debug_dir and result.debug_dir.is_dir()))
             self.manual_apply_button.setEnabled(result.rectangle is not None)
         else:
             self.result_preview.show_image(None)
             self.source_preview.set_rectangle(None)
-            self.print_button.setEnabled(False)
             self.open_diagnostics_button.setEnabled(False)
             self.manual_apply_button.setEnabled(False)
 
@@ -678,14 +677,19 @@ class MainWindow(QMainWindow):
         path = self.selected_path()
         result = self.results.get(str(path)) if path else None
         if not result or not result.output_path or not result.output_path.is_file():
-            QMessageBox.warning(self, "인쇄할 결과 없음", "먼저 이미지를 보정하세요.")
+            QMessageBox.warning(
+                self, "인쇄할 결과 없음",
+                "이미지를 추가하고 보정을 완료한 뒤 인쇄하세요.\n"
+                "보정이 실패했거나 수동 확인이 필요한 항목은 인쇄 결과 파일이 없습니다.",
+            )
             return
 
         available = QPrinterInfo.availablePrinterNames()
         if not available:
             QMessageBox.critical(
                 self, "프린터를 찾을 수 없음",
-                "Windows에 설치된 프린터가 없습니다. SELPHY 드라이버를 설치하고 연결 상태를 확인하세요.",
+                "운영체제에서 사용할 수 있는 프린터를 찾지 못했습니다. "
+                "SELPHY 드라이버 설치와 프린터 연결을 확인하세요.",
             )
             return
 
@@ -837,7 +841,7 @@ class MainWindow(QMainWindow):
 
     def set_busy(self, busy: bool) -> None:
         for button in (self.add_files_button, self.add_folder_button, self.remove_button,
-                       self.process_selected_button, self.process_all_button,
+                       self.process_selected_button, self.process_all_button, self.print_button,
                        self.manual_apply_button, self.perspective_mode):
             button.setEnabled(not busy)
 
