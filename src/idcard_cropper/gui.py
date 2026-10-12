@@ -8,8 +8,9 @@ import sys
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings, QPointF
-from PySide6.QtGui import (QDesktopServices, QImage, QPageLayout, QPageSize, QPainter,
+from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings, QEvent,
+                            QPoint, QPointF, QMimeData)
+from PySide6.QtGui import (QDesktopServices, QDrag, QImage, QPageLayout, QPageSize, QPainter,
                            QPixmap, QPen, QColor, QPolygonF)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
@@ -142,22 +143,62 @@ def _save_windows_printer_preferences(printer_name: str, parent_window: int) -> 
 
 
 class Preview(QLabel):
-    def __init__(self, title: str) -> None:
+    def __init__(self, title: str, *, allow_file_drag: bool = False) -> None:
         super().__init__(title)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(300, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("QLabel { background: #20242b; color: #d7dbe2; border: 1px solid #444b55; }")
         self._pixmap: QPixmap | None = None
+        self._file_path: Path | None = None
+        self._allow_file_drag = allow_file_drag
+        self._drag_origin: QPoint | None = None
         self._placeholder = title
+        if allow_file_drag:
+            self.setToolTip("이미지를 다른 앱으로 드래그하거나 더블클릭해 기본 사진 앱에서 여세요.")
 
     def show_image(self, path: Path | None) -> None:
         self._pixmap = QPixmap(str(path)) if path and path.is_file() else None
+        self._file_path = Path(path).resolve() if self._pixmap and self._allow_file_drag else None
         self._render()
 
     def show_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
+        self._file_path = None
         self._render()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if (self._allow_file_drag and self._file_path
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._drag_origin = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if (self._drag_origin is None or not self._file_path
+                or not (event.buttons() & Qt.MouseButton.LeftButton)):
+            return super().mouseMoveEvent(event)
+        current = event.position().toPoint()
+        if (current - self._drag_origin).manhattanLength() < QApplication.startDragDistance():
+            return super().mouseMoveEvent(event)
+
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setUrls([QUrl.fromLocalFile(str(self._file_path))])
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+                  Qt.DropAction.CopyAction)
+        self._drag_origin = None
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        self._drag_origin = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if self._allow_file_drag and self._file_path and event.button() == Qt.MouseButton.LeftButton:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._file_path)))
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
         super().resizeEvent(event)
@@ -331,6 +372,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("신분증 스캔 보정 및 인쇄")
         self.resize(1120, 720)
+        self.setAcceptDrops(True)
         self.results: dict[str, CropResult] = {}
         self.worker: ProcessWorker | None = None
 
@@ -364,7 +406,7 @@ class MainWindow(QMainWindow):
         previews = QWidget()
         preview_layout = QHBoxLayout(previews)
         self.source_preview = CropEditor("원본 미리보기")
-        self.result_preview = Preview("보정 결과 미리보기")
+        self.result_preview = Preview("보정 결과 미리보기", allow_file_drag=True)
         preview_layout.addWidget(self._preview_column("원본", self.source_preview), 1)
         preview_layout.addWidget(self._preview_column("보정 결과", self.result_preview), 1)
         splitter.addWidget(previews)
@@ -372,7 +414,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         self.crop_help = QLabel(
             "검출된 초록 사각형 안쪽을 드래그해 이동하고, 변 중간의 흰색 핸들로 크기를 조절하세요. "
-            "위쪽 주황색 핸들은 전체 회전입니다. 조정 후 ‘수동 사각형 적용’을 누르면 다시 크롭합니다."
+            "위쪽 주황색 핸들은 전체 회전입니다. 조정 후 ‘수동 사각형 적용’을 누르면 다시 크롭합니다. "
+            "파일을 프로그램 창에 드롭해 추가하고, 보정 결과는 결과 영역에서 다른 앱으로 드래그하거나 "
+            "더블클릭해 기본 사진 앱에서 열 수 있습니다."
         )
         self.crop_help.setWordWrap(True)
         layout.addWidget(self.crop_help)
@@ -416,6 +460,13 @@ class MainWindow(QMainWindow):
         self.open_diagnostics_button.setEnabled(False)
         self.manual_apply_button.setEnabled(False)
 
+        # Qt delivers drag events to the child widget under the pointer. Install
+        # the same file-drop handler on the full UI so buttons, previews, and
+        # the list all accept files just like the unused background does.
+        for widget in [root, *root.findChildren(QWidget)]:
+            widget.setAcceptDrops(True)
+            widget.installEventFilter(self)
+
     @staticmethod
     def _preview_column(title: str, preview: Preview) -> QWidget:
         column = QWidget()
@@ -453,6 +504,57 @@ class MainWindow(QMainWindow):
         if added:
             self.file_list.setCurrentRow(self.file_list.count() - added)
             self.status.setText(f"이미지 {added}개를 추가했습니다.")
+
+    @staticmethod
+    def _dropped_image_paths(mime_data: QMimeData) -> list[Path]:
+        paths = []
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in IMAGE_SUFFIXES and path.is_file():
+                paths.append(path)
+        return paths
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if self._dropped_image_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if self._dropped_image_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        paths = self._dropped_image_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        self.add_paths(paths)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt callback name
+        event_type = event.type()
+        if event_type in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if self._dropped_image_paths(event.mimeData()):
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return True
+        if event_type == QEvent.Type.Drop:
+            paths = self._dropped_image_paths(event.mimeData())
+            if paths:
+                self.add_paths(paths)
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                event.ignore()
+            return True
+        return super().eventFilter(watched, event)
 
     def remove_selected(self) -> None:
         if self.worker and self.worker.isRunning():
