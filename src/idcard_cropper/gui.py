@@ -717,10 +717,8 @@ class MainWindow(QMainWindow):
             lambda: self.save_printer_preferences(printer_combo.currentText(), dialog),
         )
         form.addRow(preferences_button)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Print | QDialogButtonBox.StandardButton.Cancel,
-            parent=dialog,
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, parent=dialog)
+        buttons.addButton("인쇄", QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
