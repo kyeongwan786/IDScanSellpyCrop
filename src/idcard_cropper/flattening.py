@@ -1,37 +1,15 @@
-#!/usr/bin/env python3
-"""
-신분증 사진 -> 8.1cm x 5.1cm (셀피 인쇄용) 자동 크롭/펴기
-
-- 어떤 배경(흰색/검정/나무/카펫 등)이든 신분증 사각형을 자동 감지
-- 기울어짐/회전/원근 왜곡을 펴서 신분증이 8.1x5.1cm 캔버스에 꽉 차게 저장
-- 얼굴 사진 위치로 180도 뒤집힘 자동 보정 (OpenCV 얼굴 검출)
-- DPI 정보를 파일에 넣어 인쇄 시 실제 크기가 8.1x5.1cm 가 되도록 함
-
-설치:  pip install opencv-python pillow numpy
-
-사용법:
-  python id_card_crop.py 사진.jpg                  -> 사진_selphy.png
-  python id_card_crop.py ./원본폴더 -o ./결과폴더    -> 폴더 일괄 처리
-  python id_card_crop.py 사진.jpg --debug          -> 감지 영역 표시 *_debug.jpg 도 저장
-  python id_card_crop.py 사진.jpg --rotate 180     -> 방향이 틀리면 수동 회전
-  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.03)
-"""
-import argparse
-import os
-import sys
+"""Card boundary detection and flatten-then-refine geometry for camera photos."""
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps
 
-TARGET_W_CM = 8.1
-TARGET_H_CM = 5.1
-CARD_RATIO = 85.6 / 53.98  # 신분증(ID-1) 가로세로비 ≈ 1.586
-EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-WORK = 1000.0  # 감지용 작업 해상도(긴 변)
+CARD_RATIO = 85.6 / 53.98  # ISO ID-1 card aspect ratio
+WORK = 1000.0  # detection working resolution, long edge
+FLAT_W = 1200
+FLAT_H = int(round(FLAT_W / CARD_RATIO))
+FLAT_M = int(round(0.10 * FLAT_H))
 
 
-# ------------------------------------------------------------------ 유틸
 def order_points(pts):
     pts = np.asarray(pts, dtype="float32").reshape(4, 2)
     s = pts.sum(axis=1)
@@ -47,12 +25,6 @@ def quad_sizes(q):
     return w, h
 
 
-def load_image(path):
-    pil = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-
-
-# ------------------------------------------------------------------ 후보 마스크
 def _auto_canny(gray, sigma=0.33):
     v = np.median(gray)
     return cv2.Canny(gray, int(max(0, (1 - sigma) * v)), int(min(255, (1 + sigma) * v)))
@@ -90,7 +62,6 @@ def _candidate_masks(small):
     return masks
 
 
-# ------------------------------------------------------------------ 후보 채점
 def _edge_contrast(lab, quad, off=4, n=40):
     """사각형 각 변의 안쪽/바깥쪽 색 차이 (신분증 경계는 대비가 뚜렷함)"""
     h, w = lab.shape[:2]
@@ -113,7 +84,7 @@ def _edge_contrast(lab, quad, off=4, n=40):
         diff = np.linalg.norm(lab[a[:, 1], a[:, 0]] - lab[b[:, 1], b[:, 0]], axis=1)
         vals.append(min(np.percentile(diff, 40), 40) / 40)
     vals = sorted(vals)
-    return 0.5 * np.mean(vals) + 0.5 * vals[1]  # 한 변 정도는 약해도 허용
+    return 0.5 * np.mean(vals) + 0.5 * vals[1]
 
 
 def _score_quad(quad, lab, hull_area):
@@ -181,7 +152,6 @@ def find_card_quad(img, return_score=False):
     return (*result, float(best_sc)) if return_score else result
 
 
-# ------------------------------------------------------------------ 꼭짓점 정밀 보정
 def _fit_line(pts):
     """Huber 직선 피팅 + 이상치 제거 후 재피팅. 반환: (점, 방향)"""
     pts = pts.astype(np.float32)
@@ -291,75 +261,6 @@ def refine_quad_silhouette(img, quad, sil):
         return new
     except Exception:
         return quad
-
-
-def refine_quad(img, quad):
-    """실제 가장자리 픽셀에 직선을 RANSAC 으로 맞춰 꼭짓점을 정밀 보정"""
-    try:
-        H, W = img.shape[:2]
-        gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-        edges = np.zeros_like(gray)
-        for ch in cv2.split(cv2.GaussianBlur(img, (3, 3), 0)) + (gray,):
-            edges = cv2.bitwise_or(edges, _auto_canny(ch))
-        ys, xs = np.nonzero(edges)
-        P = np.stack([xs, ys], axis=1).astype(np.float32)
-        band = max(8.0, 0.02 * max(H, W))
-        tol = max(2.0, 0.003 * max(H, W))
-        lines = []
-        for i in range(4):
-            p0, p1 = quad[i], quad[(i + 1) % 4]
-            d = p1 - p0
-            L = float(np.sqrt(d @ d))
-            t = ((P - p0) @ d) / (L * L)
-            sd = np.abs((P[:, 0] - p0[0]) * d[1] - (P[:, 1] - p0[1]) * d[0]) / L
-            sel = (t > 0.03) & (t < 0.97) & (sd < band)
-            if sel.sum() < 40:
-                return quad
-            Ps = P[sel]
-            r = _ransac_line(Ps, np.arctan2(d[1], d[0]), tol, L=L)
-            if r is None:
-                return quad
-            _, _, inl = r
-            if inl.sum() < 40:
-                return quad
-            lines.append(_fit_line(Ps[inl]))
-        new = []
-        for i in range(4):
-            pt = _intersect(lines[(i - 1) % 4], lines[i])
-            if pt is None or np.linalg.norm(pt - quad[i]) > 0.05 * max(H, W):
-                return quad
-            new.append(pt)
-        return np.array(new, dtype="float32")
-    except Exception:
-        return quad
-
-
-# ------------------------------------------------------------------ 변환
-def inset_quad(quad, shrink):
-    """사각형을 중심 기준으로 안쪽으로 줄임 (shrink=0.03 -> 각 변이 가로/세로의 1.5%씩 안쪽)"""
-    c = quad.mean(axis=0)
-    return (c + (quad - c) * (1 - shrink)).astype("float32")
-
-
-def warp_to_target(img, quad, out_w, out_h, shrink=0.0):
-    q = order_points(quad)
-    w, h = quad_sizes(q)
-    if h > w:  # 세로로 서 있으면 가로가 되도록 4점 순서를 돌림
-        q = np.array([q[3], q[0], q[1], q[2]], dtype="float32")
-    if shrink > 0:
-        c = q.mean(axis=0)
-        q = c + (q - c) * (1 - shrink)
-    dst = np.array([[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
-                   dtype="float32")
-    M = cv2.getPerspectiveTransform(q, dst)
-    return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
-                               borderMode=cv2.BORDER_REPLICATE)
-
-
-# ------------------------------------------------------------------ 평면화(rectify) 후 재보정
-FLAT_W = 1200                      # 평면화 작업 해상도(카드 가로 px)
-FLAT_H = int(round(FLAT_W / CARD_RATIO))
-FLAT_M = int(round(0.10 * FLAT_H))  # 카드 주변 여백(변을 찾기 위한 배경 포함)
 
 
 def landscape_quad(q):
@@ -472,129 +373,3 @@ def crop_from_flat(img, q, out_w, out_h, shrink):
     M = cv2.getPerspectiveTransform(inner_orig.astype("float32"), dst)
     return cv2.warpPerspective(img, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
                                borderMode=cv2.BORDER_REPLICATE), inner_orig.astype("float32")
-
-
-# ------------------------------------------------------------------ 방향(180도) 판별
-_FACE = None
-
-
-def _face_score(card):
-    """바로 선 얼굴이 검출되면 점수를 반환. 검출기를 쓸 수 없으면 0"""
-    global _FACE
-    try:
-        if _FACE is None:
-            if not (hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data")):
-                _FACE = []
-            else:
-                _FACE = [cv2.CascadeClassifier(cv2.data.haarcascades + n) for n in
-                         ("haarcascade_frontalface_default.xml",
-                          "haarcascade_frontalface_alt2.xml")]
-                _FACE = [d for d in _FACE if not d.empty()]
-        if not _FACE:
-            return 0.0
-        gray = cv2.equalizeHist(cv2.cvtColor(card, cv2.COLOR_BGR2GRAY))
-        best = 0.0
-        for det in _FACE:
-            for sf, mn in ((1.05, 3), (1.1, 2)):
-                res = det.detectMultiScale3(gray, scaleFactor=sf, minNeighbors=mn,
-                                            minSize=(35, 35), outputRejectLevels=True)
-                if len(res) == 3 and len(res[0]):
-                    best = max(best, float(np.max(res[2])) + 0.002 * float(
-                        np.max(res[0][:, 2])))
-        return best
-    except Exception:
-        return 0.0
-
-
-def _tess_rotation(card):
-    try:
-        import pytesseract
-        osd = pytesseract.image_to_osd(card, output_type=pytesseract.Output.DICT)
-        return int(osd.get("rotate", 0))
-    except Exception:
-        return None
-
-
-def auto_orient(card):
-    """card 는 가로형. 0도 / 180도 중 올바른 쪽을 고름. (확신 없으면 그대로)"""
-    flipped = cv2.rotate(card, cv2.ROTATE_180)
-    a, b = _face_score(card), _face_score(flipped)
-    if max(a, b) > 0 and abs(a - b) > 1e-6:
-        return card if a > b else flipped
-    r = _tess_rotation(card)
-    if r == 180:
-        return flipped
-    if max(a, b) == 0 and r is None:
-        print("   (방향 자동 판별 불가: 결과가 거꾸로면 --rotate 180 사용)")
-    return card
-
-
-# ------------------------------------------------------------------ 처리
-def process(path, out_path, dpi=300, shrink=0.03, rotate=None, debug=False):
-    img = load_image(path)
-    quad, sil = find_card_quad(img)
-    if quad is None:
-        print(f"[실패] 신분증 영역을 못 찾음: {path}")
-        return False
-    quad = refine_quad_silhouette(img, quad, sil)      # 1) 대략적 4점
-    quad = flatten_and_refine(img, quad)               # 2) 평면화 후 변 재측정(반복)
-
-    out_w = int(round(TARGET_W_CM / 2.54 * dpi))
-    out_h = int(round(TARGET_H_CM / 2.54 * dpi))
-    card, crop_quad = crop_from_flat(img, quad, out_w, out_h, shrink)  # 3) 평면 기준 안쪽 여백 + 변환
-
-    if rotate is None:
-        card = auto_orient(card)
-    elif rotate == 180:
-        card = cv2.rotate(card, cv2.ROTATE_180)
-
-    pil = Image.fromarray(cv2.cvtColor(card, cv2.COLOR_BGR2RGB))
-    if os.path.splitext(out_path)[1].lower() in (".jpg", ".jpeg"):
-        pil.save(out_path, quality=100, subsampling=0, dpi=(dpi, dpi))
-    else:
-        pil.save(out_path, dpi=(dpi, dpi))
-    print(f"[완료] {path} -> {out_path} ({out_w}x{out_h}px @ {dpi}dpi)")
-
-    if debug:
-        dbg = img.copy()
-        t = max(3, img.shape[1] // 300)
-        cv2.polylines(dbg, [quad.astype(int).reshape(-1, 1, 2)], True, (0, 255, 255), max(1, t // 2))
-        cv2.polylines(dbg, [crop_quad.astype(int).reshape(-1, 1, 2)], True, (0, 255, 0), t)
-        for p in crop_quad:
-            cv2.circle(dbg, tuple(int(v) for v in p), t * 3, (0, 0, 255), -1)
-        cv2.imwrite(os.path.splitext(out_path)[0] + "_debug.jpg", dbg)
-        flat, _ = rectify(img, quad)
-        cv2.imwrite(os.path.splitext(out_path)[0] + "_flat.jpg", flat)
-    return True
-
-
-def main():
-    ap = argparse.ArgumentParser(description="신분증 -> 8.1x5.1cm 셀피 인쇄용 자동 크롭")
-    ap.add_argument("input", help="이미지 파일 또는 폴더")
-    ap.add_argument("-o", "--output", help="출력 파일/폴더")
-    ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--shrink", type=float, default=0.03,
-                    help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.03: 각 변 약 1.5%%/1.3mm "
-                         "안쪽). 배경이 아직 보이면 0.05, 더 넓게 쓰려면 0.02")
-    ap.add_argument("--rotate", type=int, choices=[0, 180], default=None,
-                    help="자동 방향판별 대신 수동 지정 (0 또는 180)")
-    ap.add_argument("--debug", action="store_true")
-    a = ap.parse_args()
-
-    if os.path.isdir(a.input):
-        out_dir = a.output or os.path.join(a.input, "selphy_out")
-        os.makedirs(out_dir, exist_ok=True)
-        files = [f for f in sorted(os.listdir(a.input))
-                 if os.path.splitext(f)[1].lower() in EXTS]
-        ok = sum(process(os.path.join(a.input, f),
-                         os.path.join(out_dir, os.path.splitext(f)[0] + "_selphy.png"),
-                         a.dpi, a.shrink, a.rotate, a.debug) for f in files)
-        print(f"\n{ok}/{len(files)} 장 처리 완료")
-    else:
-        out = a.output or os.path.splitext(a.input)[0] + "_selphy.png"
-        if not process(a.input, out, a.dpi, a.shrink, a.rotate, a.debug):
-            sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
