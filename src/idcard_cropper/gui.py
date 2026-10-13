@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionViewItem,
     QProxyStyle,
+    QRadioButton,
     QSizePolicy,
     QStackedWidget,
     QSplitter,
@@ -533,7 +534,7 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.preview_stack, 1)
 
         preview_meta = QHBoxLayout()
-        self.preview_size = QLabel("8.1 × 5.2 cm · 300 DPI")
+        self.preview_size = QLabel("8.1 × 5.1 cm · 300 DPI")
         self.preview_size.setObjectName("mutedLabel")
         self.fill_note = QLabel("이미지 꽉 채움")
         self.fill_note.setObjectName("successBadge")
@@ -1313,19 +1314,24 @@ class MainWindow(QMainWindow):
         form.addRow("인쇄 매수", QLabel(f"{len(print_items)}장 · 사진마다 한 장씩"))
         form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
         form.addRow("방향", QLabel("가로"))
-        form.addRow(
-            "인쇄 영역",
-            QLabel("사진 81 × 52 mm 가운데 배치 · 좌우 2.5 mm / 위아래 1 mm 여백"),
-        )
+        layout_choices = QWidget(dialog)
+        layout_choices_row = QHBoxLayout(layout_choices)
+        layout_choices_row.setContentsMargins(0, 0, 0, 0)
+        fill_radio = QRadioButton("전체 채우기 (86 × 54 mm)", layout_choices)
+        center_radio = QRadioButton("가운데에 맞춤 (81 × 51 mm)", layout_choices)
+        fill_radio.setChecked(True)
+        layout_choices_row.addWidget(fill_radio)
+        layout_choices_row.addWidget(center_radio)
+        layout_choices_row.addStretch(1)
+        form.addRow("인쇄 배치", layout_choices)
         self._record_print_event(
             "print_dialog_opened",
             candidate_printer=preferred_name,
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            full_page_fill=False,
-            photo_size_mm=[81.0, 52.0],
-            margins_mm=[2.5, 1.0],
+            layout_options=["fill_entire_paper", "center_actual_size"],
+            default_layout="fill_entire_paper",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1345,6 +1351,24 @@ class MainWindow(QMainWindow):
             return
 
         selected_printer = printer_combo.currentText()
+        fill_entire_paper = fill_radio.isChecked()
+        layout_name = "fill_entire_paper" if fill_entire_paper else "center_actual_size"
+        photo_size_mm = [86.0, 54.0] if fill_entire_paper else [81.0, 51.0]
+        margins_mm = [0.0, 0.0] if fill_entire_paper else [2.5, 1.5]
+        if self._active_print_attempt:
+            self._active_print_attempt["data"].update(
+                layout=layout_name,
+                full_page_fill=fill_entire_paper,
+                photo_size_mm=photo_size_mm,
+                margins_mm=margins_mm,
+            )
+        self._record_print_event(
+            "print_layout_selected",
+            layout=layout_name,
+            full_page_fill=fill_entire_paper,
+            photo_size_mm=photo_size_mm,
+            margins_mm=margins_mm,
+        )
         settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
         settings.setValue("printing/last_printer", selected_printer)
         settings.sync()
@@ -1355,8 +1379,8 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Place the 81 x 52 mm output at its real size, centered on the 86 x
-        # 54 mm C-size sheet, leaving 2.5 mm side and 1 mm top/bottom margins.
+        # Read the actual C-size paper geometry; the chosen layout below uses
+        # either the full sheet or an 81 x 51 mm centered image region.
         # The selected media/orientation are reapplied for every print job.
         printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
@@ -1428,10 +1452,13 @@ class MainWindow(QMainWindow):
             )
             loaded_items.append((source_path, item_result, print_path))
 
-        target_width = paper.width() * 81.0 / paper_mm.width()
-        target_height = paper.height() * 52.0 / paper_mm.height()
-        target = QRectF(0, 0, target_width, target_height)
-        target.moveCenter(QRectF(paper).center())
+        if fill_entire_paper:
+            target = QRectF(paper)
+        else:
+            target_width = paper.width() * 81.0 / paper_mm.width()
+            target_height = paper.height() * 51.0 / paper_mm.height()
+            target = QRectF(0, 0, target_width, target_height)
+            target.moveCenter(QRectF(paper).center())
         if self._active_print_attempt:
             self._active_print_attempt["data"]["expected_page_count"] = len(loaded_items)
             self._active_print_attempt["data"]["target_rect_device_px"] = [
@@ -1519,8 +1546,8 @@ class MainWindow(QMainWindow):
                     "reported_paper_size_mm": [paper_mm.width(), paper_mm.height()],
                     "media": "C card (54 x 86 mm)",
                     "orientation": "landscape",
-                    "image_target_mm": [86.0, 54.0],
-                    "layout": "fill_entire_paper",
+                    "image_target_mm": photo_size_mm,
+                    "layout": layout_name,
                     "source": str(source_path),
                     "output_path": str(print_path),
                     "page_number": index + 1,
