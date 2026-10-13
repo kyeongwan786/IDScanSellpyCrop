@@ -14,7 +14,7 @@
   python id_card_crop.py ./원본폴더 -o ./결과폴더    -> 폴더 일괄 처리
   python id_card_crop.py 사진.jpg --debug          -> 감지 영역 표시 *_debug.jpg 도 저장
   python id_card_crop.py 사진.jpg --rotate 180     -> 방향이 틀리면 수동 회전
-  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.01)
+  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.02)
 """
 import argparse
 import os
@@ -903,7 +903,7 @@ def refine_quad(img, quad):
 
 # ------------------------------------------------------------------ 변환
 def inset_quad(quad, shrink):
-    """사각형을 중심 기준으로 안쪽으로 줄임 (shrink=0.01 -> 각 변이 가로/세로의 0.5%씩 안쪽)"""
+    """사각형을 중심 기준으로 안쪽으로 줄임 (shrink=0.02 -> 각 변이 가로/세로의 1%씩 안쪽)"""
     c = quad.mean(axis=0)
     return (c + (quad - c) * (1 - shrink)).astype("float32")
 
@@ -1297,7 +1297,7 @@ def auto_orient(card, return_rotation=False):
 
 
 # ------------------------------------------------------------------ 처리
-def process_image_data(img, source_path=None, dpi=300, shrink=0.01, rotate=None,
+def process_image_data(img, source_path=None, dpi=300, shrink=0.02, rotate=None,
                        verbose=False):
     """Run the single card-detection/flattening pipeline on an OpenCV BGR image."""
     quad, sil, score = find_card_quad(img, verbose=verbose, return_score=True)
@@ -1326,7 +1326,7 @@ def process_image_data(img, source_path=None, dpi=300, shrink=0.01, rotate=None,
     }
 
 
-def process(path, out_path, dpi=300, shrink=0.01, rotate=None, debug=False):
+def process(path, out_path, dpi=300, shrink=0.02, rotate=None, debug=False):
     img = load_image(path)
     result = process_image_data(img, source_path=path, dpi=dpi, shrink=shrink,
                                 rotate=rotate, verbose=debug)
@@ -1375,8 +1375,8 @@ def main():
     ap.add_argument("input", help="이미지 파일 또는 폴더")
     ap.add_argument("-o", "--output", help="출력 파일/폴더")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--shrink", type=float, default=0.01,
-                    help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.01: 각 변 약 0.5%%/0.4mm "
+    ap.add_argument("--shrink", type=float, default=0.02,
+                    help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.02: 각 변 약 1%%/0.8mm "
                          "안쪽). 배경이 아직 보이면 0.05, 더 넓게 쓰려면 0.02")
     ap.add_argument("--rotate", type=int, choices=[0, 180], default=None,
                     help="자동 방향판별 대신 수동 지정 (0 또는 180)")
