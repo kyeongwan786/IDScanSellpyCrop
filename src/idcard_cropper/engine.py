@@ -13,8 +13,9 @@ from PIL import Image, ImageOps
 
 import id_card_crop as card_algorithm
 
-PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
+PRINT_DPI = 300
 RECOGNITION_DPI = 300
+CROP_INSET_FRACTION = 0.02
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
@@ -39,11 +40,12 @@ def _load_image(path: Path) -> np.ndarray:
         return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
-def _save_image(path: Path, image: np.ndarray, *, quality: int = 95) -> None:
+def _save_image(path: Path, image: np.ndarray, *, quality: int = 95,
+                dpi: int = PRINT_DPI) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     Image.fromarray(rgb).save(path, format="JPEG", quality=quality,
-                              dpi=(300, 300), subsampling=0)
+                              dpi=(dpi, dpi), subsampling=0)
 
 
 def _diagnostic_overlay(image: np.ndarray, quad: np.ndarray,
@@ -74,14 +76,17 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         "source": str(source),
         "algorithm": "id_card_crop.process_image_data",
         "target_cm": [8.1, 5.1],
-        "dpi": 300,
-        "shrink_fraction": 0.02,
+        "dpi": None,
+        "dpi_mode": "preserve_rectified_pixels_for_target_document_size",
+        "shrink_fraction": CROP_INSET_FRACTION,
     }
 
     try:
         image = _load_image(source)
         result = card_algorithm.process_image_data(
-            image, source_path=source, dpi=300, shrink=0.02, verbose=False,
+            image, source_path=source, dpi=PRINT_DPI,
+            shrink=CROP_INSET_FRACTION, verbose=False,
+            preserve_pixels=True,
         )
         if result is None:
             info.update(status="manual_review", message="신분증 외곽을 찾지 못했습니다.")
@@ -96,22 +101,29 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         quad = np.asarray(result["quad"], dtype=np.float32)
         crop_quad = np.asarray(result["crop_quad"], dtype=np.float32)
         corrected = result["image"]
-        _save_image(output_path, corrected, quality=100)
+        working_image = result.get("working_image", image)
+        output_dpi = int(result["dpi"])
+        _save_image(output_path, corrected, quality=100, dpi=output_dpi)
         _save_image(diagnostic_path, _diagnostic_overlay(image, quad, crop_quad))
         debug_dir.mkdir(parents=True, exist_ok=True)
         _save_image(debug_dir / "00_source.jpg", image)
+        if abs(float(result.get("deskew_angle", 0.0))) >= 1.0:
+            _save_image(debug_dir / "00_source_deskewed.jpg", working_image)
         _save_image(debug_dir / "01_card_boundary_and_crop.jpg",
                     _diagnostic_overlay(image, quad, crop_quad))
         _save_image(debug_dir / "02_final.jpg", corrected, quality=100)
 
         warning = None
-        if min(image.shape[:2]) < min(PRINT_SIZE):
+        if output_dpi < PRINT_DPI:
             warning = "원본 해상도가 낮아 확대 출력 시 선명도가 제한될 수 있습니다."
         info.update(
             status="complete",
             message="id_card_crop 알고리즘으로 보정했습니다.",
             confidence=float(result["confidence"]),
             rotation=int(result["rotation"]),
+            global_deskew_angle_degrees=round(float(result.get("deskew_angle", 0.0)), 3),
+            global_deskew_confidence=round(float(result.get("deskew_confidence", 0.0)), 3),
+            dpi=output_dpi,
             source_size_px=[int(image.shape[1]), int(image.shape[0])],
             output_size_px=[int(corrected.shape[1]), int(corrected.shape[0])],
             output_path=str(output_path),

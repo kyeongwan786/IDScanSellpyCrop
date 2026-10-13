@@ -14,7 +14,7 @@
   python id_card_crop.py ./원본폴더 -o ./결과폴더    -> 폴더 일괄 처리
   python id_card_crop.py 사진.jpg --debug          -> 감지 영역 표시 *_debug.jpg 도 저장
   python id_card_crop.py 사진.jpg --rotate 180     -> 방향이 틀리면 수동 회전
-  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.02)
+  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.0)
 """
 import argparse
 import os
@@ -903,7 +903,7 @@ def refine_quad(img, quad):
 
 # ------------------------------------------------------------------ 변환
 def inset_quad(quad, shrink):
-    """사각형을 중심 기준으로 안쪽으로 줄임 (shrink=0.02 -> 각 변이 가로/세로의 1%씩 안쪽)"""
+    """사각형을 중심 기준으로 안쪽으로 줄임 (shrink=0이면 검출된 카드 경계 그대로 사용)"""
     c = quad.mean(axis=0)
     return (c + (quad - c) * (1 - shrink)).astype("float32")
 
@@ -1296,18 +1296,113 @@ def auto_orient(card, return_rotation=False):
     return card
 
 
+def _estimate_global_skew_angle(img):
+    """Estimate the shared card/text roll before trying to find its corners.
+
+    This uses long line segments only; it does not need a four-corner card
+    detection. Angles are normalized modulo 90 degrees so portrait photos and
+    slightly rotated cards use the same estimate.
+    """
+    h, w = img.shape[:2]
+    scale = min(1.0, 1000.0 / max(h, w))
+    small = cv2.resize(img, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA) if scale < 1 else img
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 40, 120)
+    sh, sw = gray.shape
+    min_length = max(24, int(0.04 * max(sh, sw)))
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180.0, threshold=max(24, min_length // 2),
+        minLineLength=min_length, maxLineGap=max(8, int(0.02 * max(sh, sw))),
+    )
+    if lines is None:
+        return 0.0, 0.0
+
+    segments = []
+    max_length = 0.45 * max(sh, sw)
+    for x1, y1, x2, y2 in lines[:, 0]:
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = float(np.hypot(dx, dy))
+        if length < min_length or length > max_length:
+            continue
+        angle = float(np.degrees(np.arctan2(dy, dx)))
+        angle = (angle + 45.0) % 90.0 - 45.0
+        if abs(angle) <= 25.0:
+            segments.append((angle, length))
+    if len(segments) < 2:
+        return 0.0, 0.0
+
+    angles = np.asarray([item[0] for item in segments], dtype=np.float32)
+    weights = np.asarray([item[1] for item in segments], dtype=np.float32)
+    bins = np.arange(-25.0, 26.0, 1.0)
+    votes = np.zeros(len(bins), dtype=np.float32)
+    for index, center in enumerate(bins):
+        votes[index] = weights[np.abs(angles - center) <= 2.0].sum()
+    peak_index = int(np.argmax(votes))
+    peak = float(votes[peak_index])
+    total = float(weights.sum())
+    confidence = peak / max(total, 1e-6)
+    if confidence < 0.18:
+        return 0.0, confidence
+    support = np.abs(angles - bins[peak_index]) <= 2.0
+    angle = float(np.average(angles[support], weights=weights[support]))
+    return angle, confidence
+
+
+def _rotate_canvas_for_deskew(img, angle):
+    """Rotate the whole source by a small roll angle without clipping corners."""
+    h, w = img.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    transform = cv2.getRotationMatrix2D(center, angle, 1.0)
+    cos_a, sin_a = abs(transform[0, 0]), abs(transform[0, 1])
+    out_w = int(np.ceil(h * sin_a + w * cos_a))
+    out_h = int(np.ceil(h * cos_a + w * sin_a))
+    transform[0, 2] += out_w / 2.0 - center[0]
+    transform[1, 2] += out_h / 2.0 - center[1]
+    rotated = cv2.warpAffine(
+        img, transform, (out_w, out_h), flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return rotated, transform
+
+
+def _map_points(points, transform):
+    inverse = cv2.invertAffineTransform(transform)
+    return cv2.transform(np.asarray(points, dtype=np.float32).reshape(1, -1, 2),
+                         inverse).reshape(-1, 2)
+
+
 # ------------------------------------------------------------------ 처리
-def process_image_data(img, source_path=None, dpi=300, shrink=0.02, rotate=None,
-                       verbose=False):
+def process_image_data(img, source_path=None, dpi=300, shrink=0.0, rotate=None,
+                       verbose=False, preserve_pixels=False):
     """Run the single card-detection/flattening pipeline on an OpenCV BGR image."""
-    quad, sil, score = find_card_quad(img, verbose=verbose, return_score=True)
+    # First level the whole photo using long line segments, then detect card
+    # corners in the leveled frame. Perspective rectification still follows.
+    deskew_angle, deskew_confidence = _estimate_global_skew_angle(img)
+    if abs(deskew_angle) >= 1.0:
+        working_img, deskew_transform = _rotate_canvas_for_deskew(img, deskew_angle)
+    else:
+        working_img = img
+        deskew_transform = None
+        deskew_angle = 0.0
+    quad, sil, score = find_card_quad(working_img, verbose=verbose, return_score=True)
     if quad is None:
         return None
-    focal_px = exif_focal_px(source_path, img.shape) if source_path else None
-    quad = finalize_quad(img, quad, sil, verbose=verbose, f_px=focal_px)
-    out_w = int(round(TARGET_W_CM / 2.54 * dpi))
-    out_h = int(round(TARGET_H_CM / 2.54 * dpi))
-    card, crop_quad = crop_from_flat(img, quad, out_w, out_h, shrink)
+    focal_px = exif_focal_px(source_path, working_img.shape) if source_path else None
+    quad = finalize_quad(working_img, quad, sil, verbose=verbose, f_px=focal_px)
+    # Do the final edge alignment in the rectified plane before cropping.
+    quad = landscape_quad(flatten_and_refine(working_img, quad))
+    output_dpi = dpi
+    if preserve_pixels:
+        rectified_w, rectified_h = quad_sizes(quad)
+        width_in = TARGET_W_CM / 2.54
+        height_in = TARGET_H_CM / 2.54
+        output_dpi = max(1, int(round(min(rectified_w / width_in,
+                                          rectified_h / height_in))))
+    out_w = int(round(TARGET_W_CM / 2.54 * output_dpi))
+    out_h = int(round(TARGET_H_CM / 2.54 * output_dpi))
+    card, crop_quad = crop_from_flat(working_img, quad, out_w, out_h, shrink)
     if rotate is None:
         card, rotation = auto_orient(card, return_rotation=True)
     elif rotate == 180:
@@ -1315,18 +1410,26 @@ def process_image_data(img, source_path=None, dpi=300, shrink=0.02, rotate=None,
         rotation = 180
     else:
         rotation = 0
+    if deskew_transform is not None:
+        source_quad = _map_points(quad, deskew_transform)
+        source_crop_quad = _map_points(crop_quad, deskew_transform)
+    else:
+        source_quad, source_crop_quad = quad, crop_quad
     return {
         "image": card,
-        "quad": quad,
-        "crop_quad": crop_quad,
+        "quad": source_quad,
+        "crop_quad": source_crop_quad,
+        "working_image": working_img,
+        "deskew_angle": deskew_angle,
+        "deskew_confidence": deskew_confidence,
         "confidence": float(score),
         "rotation": rotation,
-        "dpi": dpi,
+        "dpi": output_dpi,
         "size": [out_w, out_h],
     }
 
 
-def process(path, out_path, dpi=300, shrink=0.02, rotate=None, debug=False):
+def process(path, out_path, dpi=300, shrink=0.0, rotate=None, debug=False):
     img = load_image(path)
     result = process_image_data(img, source_path=path, dpi=dpi, shrink=shrink,
                                 rotate=rotate, verbose=debug)
@@ -1375,8 +1478,8 @@ def main():
     ap.add_argument("input", help="이미지 파일 또는 폴더")
     ap.add_argument("-o", "--output", help="출력 파일/폴더")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--shrink", type=float, default=0.02,
-                    help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.02: 각 변 약 1%%/0.8mm "
+    ap.add_argument("--shrink", type=float, default=0.0,
+                    help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.0: 검출 경계 그대로 사용; "
                          "안쪽). 배경이 아직 보이면 0.05, 더 넓게 쓰려면 0.02")
     ap.add_argument("--rotate", type=int, choices=[0, 180], default=None,
                     help="자동 방향판별 대신 수동 지정 (0 또는 180)")
