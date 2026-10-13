@@ -112,6 +112,13 @@ if errorlevel 1 exit /b 1
 for %%F in ("%TESSERACT_DIR%\*.dll") do if exist "%%~fF" copy /y "%%~fF" "build\win-tesseract\" >nul
 copy /y "src\idcard_cropper\tessdata\kor.traineddata" "build\win-tesseract\tessdata\kor.traineddata" >nul
 if errorlevel 1 exit /b 1
+if not exist "%TESSERACT_DIR%\tessdata\osd.traineddata" (
+    echo ERROR: Tesseract's osd.traineddata was not found in "%TESSERACT_DIR%\tessdata".
+    echo Install the Orientation and Script Detection data, then rerun this file.
+    exit /b 1
+)
+copy /y "%TESSERACT_DIR%\tessdata\osd.traineddata" "build\win-tesseract\tessdata\osd.traineddata" >nul
+if errorlevel 1 exit /b 1
 "build\win-tesseract\tesseract.exe" --version
 if errorlevel 1 (
     echo ERROR: The staged Tesseract executable could not start.
@@ -122,6 +129,12 @@ set "TESSDATA_PREFIX=%CD%\build\win-tesseract\tessdata"
 findstr /I /X "kor" "build\win-tesseract\languages.txt" >nul
 if errorlevel 1 (
     echo ERROR: Tesseract could not read the bundled Korean language model.
+    type "build\win-tesseract\languages.txt"
+    exit /b 1
+)
+findstr /I /X "osd" "build\win-tesseract\languages.txt" >nul
+if errorlevel 1 (
+    echo ERROR: Tesseract could not read its bundled orientation data.
     type "build\win-tesseract\languages.txt"
     exit /b 1
 )

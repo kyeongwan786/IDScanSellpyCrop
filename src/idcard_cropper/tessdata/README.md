@@ -1,6 +1,7 @@
 `kor.traineddata` is from the official Tesseract OCR `tessdata_fast` repository:
 https://github.com/tesseract-ocr/tessdata_fast
 
-The trained data is distributed under Apache License 2.0. It is used locally
-only to compare OCR confidence for the four possible image rotations. The
-recognized text is neither returned nor written to disk.
+It is distributed under Apache License 2.0. The orientation check uses
+Tesseract's separate `osd.traineddata`, which the Windows build copies from
+the Tesseract installation. It only reads the orientation result; recognized
+text is not retained or written.

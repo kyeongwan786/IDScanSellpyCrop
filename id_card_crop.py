@@ -1258,6 +1258,18 @@ def _face_score(card):
 def _tess_rotation(card):
     try:
         import pytesseract
+        # PyInstaller's one-file build extracts bundled tools under _MEIPASS.
+        # Point pytesseract at that executable and its staged traineddata so
+        # OSD does not silently fall back to an unrelated system install.
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root:
+            tesseract_dir = os.path.join(bundle_root, "tesseract")
+            executable = os.path.join(tesseract_dir, "tesseract.exe")
+            tessdata_dir = os.path.join(tesseract_dir, "tessdata")
+            if os.path.isfile(executable):
+                pytesseract.pytesseract.tesseract_cmd = executable
+                if os.path.isdir(tessdata_dir):
+                    os.environ["TESSDATA_PREFIX"] = tessdata_dir
         osd = pytesseract.image_to_osd(card, output_type=pytesseract.Output.DICT)
         return int(osd.get("rotate", 0))
     except Exception:

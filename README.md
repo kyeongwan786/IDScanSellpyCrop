@@ -16,7 +16,7 @@ python -m pip install '.[ocr]'
 
 GUI까지 설치하려면 `python -m pip install '.[ocr,gui]'`를 사용하세요. 설치 후 `idcard-crop-gui`를 실행하면 파일 선택 화면이 열립니다. 소스에서 직접 실행할 때는 프로젝트 폴더에서 `python run_gui.py`를 사용합니다.
 
-방향 판별에는 Python 패키지 외에 Tesseract OCR 실행 파일이 필요합니다. 한국어 OCR 모델은 프로젝트에 포함되어 네 방향의 인식 신뢰도만 로컬 비교합니다. 인식한 문장은 저장하거나 출력하지 않습니다. OCR을 설치하지 않았거나 판별이 불확실하면 자동 저장 대신 수동 확인 상태가 됩니다. PDF 지원은 다음 단계에서 추가할 예정입니다.
+방향 판별에는 Tesseract OCR 실행 파일과 OSD 방향 판별 모델이 필요합니다. Windows 실행 파일에는 Tesseract와 `osd.traineddata`를 함께 포함하며, 빌드 중 두 모델을 읽을 수 있는지 확인합니다. 방향 판별은 로컬에서 처리하고 인식한 문장은 저장하거나 출력하지 않습니다. PDF 지원은 다음 단계에서 추가할 예정입니다.
 
 ## 사용법
 
