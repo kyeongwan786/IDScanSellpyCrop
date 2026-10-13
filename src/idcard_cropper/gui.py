@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime
 from pathlib import Path
+import subprocess
 import sys
+from uuid import uuid4
 
 import cv2
-from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QUrl, QSizeF, QSettings, QEvent,
+from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QUrl, QSize, QSizeF, QSettings, QEvent,
+                            QTimer,
                             QPoint, QMimeData)
-from PySide6.QtGui import (QDesktopServices, QDrag, QImage, QPageLayout, QPageSize, QPainter,
-                           QPixmap)
+from PySide6.QtGui import (QDesktopServices, QDrag, QIcon, QImage, QImageReader,
+                           QPageLayout, QPageSize, QPainter, QPixmap)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -28,6 +35,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -150,7 +158,11 @@ class Preview(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(300, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setStyleSheet("QLabel { background: #20242b; color: #d7dbe2; border: 1px solid #444b55; }")
+        self.setObjectName("imagePreview")
+        self.setStyleSheet(
+            "QLabel { background: #f4f6f8; color: #778197; "
+            "border: 1px dashed #ccd3dd; border-radius: 12px; padding: 12px; }"
+        )
         self._pixmap: QPixmap | None = None
         self._file_path: Path | None = None
         self._allow_file_drag = allow_file_drag
@@ -232,102 +244,251 @@ class ProcessWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("신분증 스캔 보정 및 인쇄")
-        self.resize(1120, 720)
+        self.setWindowTitle("셀피 카드 스튜디오")
+        self.resize(1240, 820)
+        self.setMinimumSize(980, 680)
         self.setAcceptDrops(True)
         self.results: dict[str, CropResult] = {}
         self.recognition_outputs: dict[str, Path] = {}
         self.worker: ProcessWorker | None = None
         self.pending_processing: list[Path] = []
+        self.pending_photoshop_paths: list[Path] = []
+        self.photoshop_launch_pending = False
+        self._active_print_attempt: dict | None = None
+        self.last_print_log_error: str | None = None
+        self._updating_selection = False
+        self.is_busy = False
 
         root = QWidget()
+        root.setObjectName("appRoot")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
 
-        toolbar = QHBoxLayout()
-        self.add_files_button = QPushButton("이미지 추가")
-        self.add_folder_button = QPushButton("폴더 추가")
-        self.remove_button = QPushButton("목록에서 제거")
-        toolbar.addWidget(self.add_files_button)
-        toolbar.addWidget(self.add_folder_button)
-        toolbar.addWidget(self.remove_button)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
-
-        output_row = QHBoxLayout()
-        output_row.addWidget(QLabel("결과 폴더"))
+        header = QHBoxLayout()
+        title_block = QVBoxLayout()
+        title = QLabel("셀피 카드 스튜디오")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("사진을 모아 한 번에 보정하고 인쇄하세요")
+        subtitle.setObjectName("appSubtitle")
+        title_block.addWidget(title)
+        title_block.addWidget(subtitle)
+        header.addLayout(title_block)
+        header.addStretch(1)
+        header.addWidget(QLabel("저장 위치"))
         self.output_edit = QLineEdit(str(Path.cwd() / "output"))
+        self.output_edit.setMinimumWidth(220)
         self.output_browse_button = QPushButton("찾아보기")
-        output_row.addWidget(self.output_edit, 1)
-        output_row.addWidget(self.output_browse_button)
-        layout.addLayout(output_row)
+        header.addWidget(self.output_edit)
+        header.addWidget(self.output_browse_button)
+        layout.addLayout(header)
+
+        steps = QLabel("1   사진 추가      ─────────      2   결과 확인      ─────────      3   선택 인쇄")
+        steps.setObjectName("steps")
+        steps.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(steps)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.file_list = QListWidget()
-        self.file_list.setMinimumWidth(250)
-        splitter.addWidget(self.file_list)
+        splitter.setObjectName("workspaceSplitter")
 
-        previews = QWidget()
-        preview_layout = QHBoxLayout(previews)
+        list_panel = QFrame()
+        list_panel.setObjectName("panel")
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(16, 16, 16, 14)
+        list_layout.setSpacing(10)
+        list_header = QHBoxLayout()
+        list_title = QLabel("사진 목록")
+        list_title.setObjectName("sectionTitle")
+        self.file_count = QLabel("0개")
+        self.file_count.setObjectName("countBadge")
+        list_header.addWidget(list_title)
+        list_header.addWidget(self.file_count)
+        list_header.addStretch(1)
+        self.add_files_button = QPushButton("＋ 사진 추가")
+        self.add_files_button.setObjectName("secondaryButton")
+        list_header.addWidget(self.add_files_button)
+        self.add_folder_button = QPushButton("폴더")
+        self.add_folder_button.setObjectName("secondaryButton")
+        list_header.addWidget(self.add_folder_button)
+        list_layout.addLayout(list_header)
+
+        self.select_all_checkbox = QCheckBox("모두 선택")
+        self.select_all_checkbox.setTristate(True)
+        list_layout.addWidget(self.select_all_checkbox)
+        self.file_list = QListWidget()
+        self.file_list.setObjectName("photoList")
+        self.file_list.setMinimumWidth(320)
+        self.file_list.setIconSize(QSize(52, 52))
+        self.file_list.setSpacing(6)
+        list_layout.addWidget(self.file_list, 1)
+        self.drop_hint = QLabel("사진을 여기에 끌어놓으세요")
+        self.drop_hint.setObjectName("dropHint")
+        self.drop_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        list_layout.addWidget(self.drop_hint)
+        list_actions = QHBoxLayout()
+        self.remove_button = QPushButton("선택 삭제")
+        self.remove_all_button = QPushButton("전체 삭제")
+        list_actions.addWidget(self.remove_button)
+        list_actions.addWidget(self.remove_all_button)
+        list_layout.addLayout(list_actions)
+        splitter.addWidget(list_panel)
+
+        preview_panel = QFrame()
+        preview_panel.setObjectName("panel")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(18, 16, 18, 14)
+        preview_layout.setSpacing(12)
+        preview_header = QHBoxLayout()
+        preview_title = QLabel("미리보기")
+        preview_title.setObjectName("sectionTitle")
+        self.preview_filename = QLabel("사진을 선택하세요")
+        self.preview_filename.setObjectName("mutedLabel")
+        preview_header.addWidget(preview_title)
+        preview_header.addStretch(1)
+        preview_header.addWidget(self.preview_filename)
+        preview_layout.addLayout(preview_header)
+
+        tabs = QHBoxLayout()
+        self.source_tab = QPushButton("원본")
+        self.result_tab = QPushButton("보정 결과")
+        for tab in (self.source_tab, self.result_tab):
+            tab.setObjectName("tabButton")
+            tab.setCheckable(True)
+            tabs.addWidget(tab)
+        tabs.addStretch(1)
+        preview_layout.addLayout(tabs)
+
+        self.preview_stack = QStackedWidget()
         self.source_preview = Preview("원본 미리보기")
         self.result_preview = Preview("보정 결과 미리보기", allow_file_drag=True)
-        preview_layout.addWidget(self._preview_column("원본", self.source_preview), 1)
-        preview_layout.addWidget(self._preview_column("보정 결과", self.result_preview), 1)
-        splitter.addWidget(previews)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter, 1)
-        self.crop_help = QLabel(
-            "이미지를 추가해도 자동 처리하지 않습니다. 선택 항목 보정/전체 보정은 신분증을 크롭합니다. "
-            "'인식 안 될 때 누르는 버튼'은 크롭 결과가 있으면 그 결과에, 없으면 원본에 색·밝기 보정만 추가 적용합니다. "
-            "이 버튼은 새 크롭을 하지 않습니다. "
-            "보정 결과는 결과 영역에서 다른 앱으로 드래그하거나 "
-            "더블클릭해 기본 사진 앱에서 열 수 있습니다."
-        )
-        self.crop_help.setWordWrap(True)
-        layout.addWidget(self.crop_help)
+        self.preview_stack.addWidget(self.source_preview)
+        self.preview_stack.addWidget(self.result_preview)
+        preview_layout.addWidget(self.preview_stack, 1)
 
-        actions = QHBoxLayout()
-        self.process_selected_button = QPushButton("선택 항목 보정")
-        self.process_all_button = QPushButton("전체 보정")
-        self.recognition_enhance_button = QPushButton("인식 안 될 때 누르는 버튼")
+        preview_meta = QHBoxLayout()
+        self.preview_size = QLabel("8.1 × 5.2 cm · 300 DPI")
+        self.preview_size.setObjectName("mutedLabel")
+        self.fill_note = QLabel("이미지 꽉 채움")
+        self.fill_note.setObjectName("successBadge")
+        preview_meta.addWidget(self.preview_size)
+        preview_meta.addStretch(1)
+        preview_meta.addWidget(self.fill_note)
+        preview_layout.addLayout(preview_meta)
+
+        preview_tools = QHBoxLayout()
+        self.recognition_enhance_button = QPushButton("인식 보정")
         self.recognition_enhance_button.setToolTip(
-            "비포·애프터 예시에서 추출한 밝기·채도 분포를 참고해 보정합니다. "
-            "크롭 결과가 있으면 그 이미지에, 없으면 업로드 원본에 적용합니다."
+            "현재 사진에 밝기와 색 보정을 추가합니다. 새 크롭은 하지 않습니다."
         )
-        self.print_button = QPushButton("보정 결과 인쇄")
-        self.open_diagnostics_button = QPushButton("단계별 진단 열기")
+        self.open_diagnostics_button = QPushButton("단계별 진단")
         self.open_output_button = QPushButton("결과 폴더 열기")
-        actions.addWidget(self.process_selected_button)
-        actions.addWidget(self.process_all_button)
-        actions.addWidget(self.recognition_enhance_button)
-        actions.addStretch(1)
-        actions.addWidget(self.print_button)
-        actions.addWidget(self.open_diagnostics_button)
-        actions.addWidget(self.open_output_button)
-        layout.addLayout(actions)
+        self.open_print_logs_button = QPushButton("인쇄 로그 열기")
+        preview_tools.addWidget(self.recognition_enhance_button)
+        preview_tools.addStretch(1)
+        preview_tools.addWidget(self.open_diagnostics_button)
+        preview_tools.addWidget(self.open_output_button)
+        preview_tools.addWidget(self.open_print_logs_button)
+        preview_layout.addLayout(preview_tools)
 
-        self.status = QLabel(
-            "이미지를 추가했습니다. 선택 항목 보정/전체 보정 또는 인식 보정 버튼을 눌러 작업을 선택하세요."
+        splitter.addWidget(preview_panel)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([370, 810])
+        layout.addWidget(splitter, 1)
+
+        footer = QFrame()
+        footer.setObjectName("actionBar")
+        actions = QHBoxLayout(footer)
+        actions.setContentsMargins(14, 10, 14, 10)
+        self.process_selected_button = QPushButton("선택 항목 보정")
+        self.process_selected_button.setObjectName("secondaryButton")
+        self.clear_selection_button = QPushButton("선택 해제")
+        self.selected_count = QLabel("0개 선택됨")
+        self.selected_count.setObjectName("selectedCount")
+        actions.addWidget(self.selected_count)
+        actions.addSpacing(12)
+        actions.addWidget(self.clear_selection_button)
+        actions.addWidget(self.process_selected_button)
+        self.process_all_button = QPushButton("전체 보정")
+        self.process_all_button.setObjectName("secondaryButton")
+        actions.addWidget(self.process_all_button)
+        actions.addStretch(1)
+        self.print_button = QPushButton("선택 항목 인쇄")
+        self.print_button.setObjectName("primaryButton")
+        self.print_button.setMinimumWidth(170)
+        self.print_all_button = QPushButton("전체 인쇄")
+        self.print_all_button.setObjectName("primaryButton")
+        self.print_all_button.setMinimumWidth(140)
+        self.edit_selected_button = QPushButton("수정하기")
+        self.edit_selected_button.setObjectName("secondaryButton")
+        self.edit_selected_button.setToolTip(
+            "체크한 사진을 목록 순서대로 Photoshop에서 엽니다."
         )
+        actions.addWidget(self.print_button)
+        actions.addWidget(self.print_all_button)
+        actions.addWidget(self.edit_selected_button)
+        layout.addWidget(footer)
+
+        self.status = QLabel("사진을 추가하거나 이 창으로 끌어오세요.")
+        self.status.setObjectName("statusLine")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+
+        self.setStyleSheet("""
+            QMainWindow, QWidget#appRoot { background: #f4f6f9; color: #17233c; }
+            QWidget { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; font-size: 10pt; }
+            QFrame#panel { background: #ffffff; border: 1px solid #e0e5ec; border-radius: 14px; }
+            QFrame#actionBar { background: #ffffff; border: 1px solid #e0e5ec; border-radius: 12px; }
+            QLabel#appTitle { font-size: 20pt; font-weight: 700; color: #14213d; }
+            QLabel#appSubtitle, QLabel#mutedLabel, QLabel#statusLine { color: #69758b; }
+            QLabel#steps { color: #53627a; background: #eaf1f3; border-radius: 10px; padding: 9px; }
+            QLabel#sectionTitle { font-size: 14pt; font-weight: 700; color: #17233c; }
+            QLabel#countBadge, QLabel#successBadge { color: #087e80; background: #e4f4f1; border-radius: 9px; padding: 5px 9px; }
+            QLabel#selectedCount { font-size: 12pt; font-weight: 700; color: #087e80; }
+            QLabel#dropHint { color: #778197; border: 1px dashed #c8d0dc; border-radius: 10px; padding: 12px; }
+            QLineEdit { background: #ffffff; border: 1px solid #d6dde7; border-radius: 8px; padding: 8px 10px; color: #17233c; }
+            QListWidget#photoList { background: transparent; border: none; outline: none; }
+            QListWidget#photoList::item { background: #ffffff; border: 1px solid #e1e6ed; border-radius: 9px; padding: 13px 9px; margin: 1px 0; color: #24324b; }
+            QListWidget#photoList::item:hover { border-color: #98c9c6; background: #f8fbfb; }
+            QCheckBox { color: #34435d; spacing: 8px; }
+            QPushButton { background: #ffffff; color: #34435d; border: 1px solid #d6dde7; border-radius: 8px; padding: 8px 12px; }
+            QPushButton:hover { background: #f2f7f7; border-color: #94c9c5; }
+            QPushButton:disabled { color: #9aa4b4; background: #f0f2f5; border-color: #e2e6ec; }
+            QPushButton#secondaryButton { background: #ffffff; }
+            QPushButton#primaryButton { color: #ffffff; background: #078b88; border: 1px solid #078b88; font-weight: 700; padding: 11px 16px; }
+            QPushButton#primaryButton:hover { background: #067775; }
+            QPushButton#tabButton { background: #f1f3f6; border: none; border-radius: 8px; padding: 8px 18px; }
+            QPushButton#tabButton:checked { color: #087e80; background: #e2f3f0; font-weight: 700; }
+        """)
 
         self.add_files_button.clicked.connect(self.add_files)
         self.add_folder_button.clicked.connect(self.add_folder)
         self.remove_button.clicked.connect(self.remove_selected)
+        self.remove_all_button.clicked.connect(self.remove_all)
         self.output_browse_button.clicked.connect(self.choose_output)
         self.process_selected_button.clicked.connect(self.process_selected)
         self.process_all_button.clicked.connect(self.process_all)
         self.recognition_enhance_button.clicked.connect(self.enhance_selected_for_recognition)
         self.file_list.currentItemChanged.connect(self.selection_changed)
-        self.print_button.clicked.connect(self.handle_print_clicked)
+        self.file_list.itemChanged.connect(self.selection_checks_changed)
+        self.select_all_checkbox.toggled.connect(self.set_all_selected)
+        self.clear_selection_button.clicked.connect(self.clear_selection)
+        self.source_tab.clicked.connect(lambda: self.set_preview_mode("source"))
+        self.result_tab.clicked.connect(lambda: self.set_preview_mode("result"))
+        self.print_button.clicked.connect(
+            lambda: self.handle_print_clicked(self.selected_paths(), "선택한"),
+        )
+        self.print_all_button.clicked.connect(
+            lambda: self.handle_print_clicked(self.all_paths(), "전체"),
+        )
+        self.edit_selected_button.clicked.connect(self.edit_selected_images)
         self.open_diagnostics_button.clicked.connect(self.open_diagnostics)
         self.open_output_button.clicked.connect(self.open_output)
-        # Keep this actionable even before processing so a click can explain
-        # why there is no printable result instead of appearing unresponsive.
-        self.print_button.setEnabled(True)
+        self.open_print_logs_button.clicked.connect(self.open_print_logs)
         self.open_diagnostics_button.setEnabled(False)
         self.recognition_enhance_button.setEnabled(False)
+        self.source_tab.setChecked(True)
+        self.update_selection_controls()
 
         # Qt delivers drag events to the child widget under the pointer. Install
         # the same file-drop handler on the full UI so buttons, previews, and
@@ -335,16 +496,6 @@ class MainWindow(QMainWindow):
         for widget in [root, *root.findChildren(QWidget)]:
             widget.setAcceptDrops(True)
             widget.installEventFilter(self)
-
-    @staticmethod
-    def _preview_column(title: str, preview: Preview) -> QWidget:
-        column = QWidget()
-        layout = QVBoxLayout(column)
-        label = QLabel(title)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
-        layout.addWidget(preview, 1)
-        return column
 
     def add_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -365,16 +516,22 @@ class MainWindow(QMainWindow):
         for path in paths:
             resolved = str(path.resolve())
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES and resolved not in known:
-                item = QListWidgetItem(f"대기 중 · {path.name}")
+                item = QListWidgetItem(f"대기 중   ·   {path.name}")
                 item.setData(USER_ROLE, resolved)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Checked)
+                item.setIcon(QIcon(resolved))
+                item.setToolTip(resolved)
                 self.file_list.addItem(item)
                 known.add(resolved)
                 added_paths.append(Path(resolved))
         if added_paths:
             self.file_list.setCurrentRow(self.file_list.count() - len(added_paths))
             self.status.setText(
-                f"이미지 {len(added_paths)}개를 추가했습니다. 실행할 작업을 선택하세요."
+                f"{len(added_paths)}개 사진을 추가하고 선택했습니다."
             )
+        self.drop_hint.setVisible(self.file_list.count() == 0)
+        self.update_selection_controls()
 
     @staticmethod
     def _dropped_image_paths(mime_data: QMimeData) -> list[Path]:
@@ -430,13 +587,57 @@ class MainWindow(QMainWindow):
     def remove_selected(self) -> None:
         if self.worker and self.worker.isRunning():
             return
-        row = self.file_list.currentRow()
-        if row >= 0:
-            item = self.file_list.takeItem(row)
-            raw_path = item.data(USER_ROLE)
-            self.results.pop(raw_path, None)
-            self.recognition_outputs.pop(raw_path, None)
+        rows = [i for i in range(self.file_list.count())
+                if self.file_list.item(i).checkState() == Qt.CheckState.Checked]
+        if not rows:
+            self.status.setText("목록에서 제거할 사진을 먼저 선택하세요.")
+            return
+        self.file_list.blockSignals(True)
+        try:
+            for row in reversed(rows):
+                item = self.file_list.takeItem(row)
+                raw_path = item.data(USER_ROLE)
+                self.results.pop(raw_path, None)
+                self.recognition_outputs.pop(raw_path, None)
+        finally:
+            self.file_list.blockSignals(False)
+        self.drop_hint.setVisible(self.file_list.count() == 0)
+        if self.file_list.count():
+            self.file_list.setCurrentRow(min(rows[0], self.file_list.count() - 1))
             self.selection_changed(self.file_list.currentItem(), None)
+        else:
+            self.selection_changed(None, None)
+        self.update_selection_controls()
+        self.status.setText(f"{len(rows)}개 사진을 목록에서 제거했습니다.")
+
+    def remove_all(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        total = self.file_list.count()
+        if not total:
+            return
+        answer = QMessageBox.question(
+            self, "목록 전체 삭제",
+            f"목록의 사진 {total}개를 모두 제거할까요?\n원본 파일은 삭제되지 않습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.file_list.blockSignals(True)
+        try:
+            for index in range(self.file_list.count()):
+                item = self.file_list.item(index)
+                raw_path = item.data(USER_ROLE)
+                self.results.pop(raw_path, None)
+                self.recognition_outputs.pop(raw_path, None)
+            self.file_list.clear()
+        finally:
+            self.file_list.blockSignals(False)
+        self.drop_hint.setVisible(True)
+        self.selection_changed(None, None)
+        self.update_selection_controls()
+        self.status.setText(f"목록에서 사진 {total}개를 모두 제거했습니다. 원본 파일은 그대로 있습니다.")
 
     def choose_output(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "결과 폴더 선택", self.output_edit.text())
@@ -447,16 +648,115 @@ class MainWindow(QMainWindow):
         item = self.file_list.currentItem()
         return Path(item.data(USER_ROLE)) if item else None
 
+    def selected_paths(self) -> list[Path]:
+        return [
+            Path(self.file_list.item(i).data(USER_ROLE))
+            for i in range(self.file_list.count())
+            if self.file_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def all_paths(self) -> list[Path]:
+        return [
+            Path(self.file_list.item(i).data(USER_ROLE))
+            for i in range(self.file_list.count())
+        ]
+
+    def set_all_selected(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._updating_selection = True
+        try:
+            for i in range(self.file_list.count()):
+                self.file_list.item(i).setCheckState(state)
+        finally:
+            self._updating_selection = False
+        self.update_selection_controls()
+
+    def clear_selection(self) -> None:
+        self.set_all_selected(False)
+        self.status.setText("사진 선택을 해제했습니다.")
+
+    def selection_checks_changed(self, _item: QListWidgetItem) -> None:
+        if self._updating_selection:
+            return
+        self.update_selection_controls()
+
+    def update_selection_controls(self) -> None:
+        total = self.file_list.count()
+        selected = self.selected_paths()
+        count = len(selected)
+        self.file_count.setText(f"{total}개")
+        self.selected_count.setText(f"{count}개 선택됨")
+
+        busy = self.is_busy
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setEnabled(total > 0 and not busy)
+        if count == 0:
+            self.select_all_checkbox.setCheckState(Qt.CheckState.Unchecked)
+        elif count == total:
+            self.select_all_checkbox.setCheckState(Qt.CheckState.Checked)
+        else:
+            self.select_all_checkbox.setCheckState(Qt.CheckState.PartiallyChecked)
+        self.select_all_checkbox.blockSignals(False)
+
+        self.process_selected_button.setEnabled(count > 0 and not busy)
+        self.process_all_button.setEnabled(total > 0 and not busy)
+        self.clear_selection_button.setEnabled(count > 0 and not busy)
+        self.remove_button.setEnabled(count > 0 and not busy)
+        self.remove_all_button.setEnabled(total > 0 and not busy)
+        ready_to_print = count > 0 and all(self._printable_path(path) for path in selected)
+        self.print_button.setEnabled(ready_to_print and not busy)
+        all_paths = self.all_paths()
+        all_ready = bool(total) and all(self._printable_path(path) for path in all_paths)
+        self.print_all_button.setEnabled(all_ready and not busy)
+        self.edit_selected_button.setEnabled(count > 0 and not busy and not self.photoshop_launch_pending)
+        if busy:
+            self.print_button.setToolTip("보정이 끝난 뒤 선택한 사진을 한 번에 인쇄할 수 있습니다.")
+            self.print_all_button.setToolTip("보정이 끝난 뒤 목록의 모든 사진을 순서대로 인쇄합니다.")
+        elif not count:
+            self.print_button.setToolTip("인쇄할 사진을 선택하세요.")
+        elif not ready_to_print:
+            self.print_button.setToolTip("선택한 사진을 먼저 모두 보정하세요.")
+        else:
+            self.print_button.setToolTip(f"선택한 {count}개 사진을 한 번에 인쇄합니다.")
+        if not busy and not total:
+            self.print_all_button.setToolTip("먼저 사진을 목록에 추가하세요.")
+        elif not busy and not all_ready:
+            self.print_all_button.setToolTip("목록의 사진을 모두 보정한 뒤 인쇄할 수 있습니다.")
+        elif not busy:
+            self.print_all_button.setToolTip(f"목록의 {total}개 사진을 순서대로 인쇄합니다.")
+
+    def _printable_path(self, path: Path) -> Path | None:
+        raw_path = str(path)
+        recognition_path = self.recognition_outputs.get(raw_path)
+        if recognition_path and recognition_path.is_file():
+            return recognition_path
+        result = self.results.get(raw_path)
+        if (result and result.status == "complete" and result.output_path
+                and result.output_path.is_file()):
+            return result.output_path
+        return None
+
+    def set_preview_mode(self, mode: str) -> None:
+        is_result = mode == "result"
+        self.preview_stack.setCurrentWidget(
+            self.result_preview if is_result else self.source_preview
+        )
+        self.result_tab.setChecked(is_result)
+        self.source_tab.setChecked(not is_result)
+
     def process_selected(self) -> None:
-        path = self.selected_path()
-        if path:
-            self.start_processing([path])
+        paths = self.selected_paths()
+        if not paths:
+            self.status.setText("보정할 사진을 선택하세요.")
+            return
+        self.start_processing(paths)
 
     def process_all(self) -> None:
-        paths = [Path(self.file_list.item(i).data(USER_ROLE))
-                 for i in range(self.file_list.count())]
-        if paths:
-            self.start_processing(paths)
+        paths = self.all_paths()
+        if not paths:
+            self.status.setText("보정할 사진이 목록에 없습니다.")
+            return
+        self.start_processing(paths)
 
     def start_processing(self, paths: list[Path]) -> None:
         if self.worker and self.worker.isRunning():
@@ -464,6 +764,11 @@ class MainWindow(QMainWindow):
             return
         for path in paths:
             self.recognition_outputs.pop(str(path), None)
+            for index in range(self.file_list.count()):
+                item = self.file_list.item(index)
+                if item.data(USER_ROLE) == str(path):
+                    item.setText(f"처리 중   ·   {path.name}")
+                    break
         output_dir = Path(self.output_edit.text()).expanduser()
         self.set_busy(True)
         self.status.setText(
@@ -473,6 +778,7 @@ class MainWindow(QMainWindow):
         self.worker.item_done.connect(self.processing_done)
         self.worker.finished.connect(self.processing_finished)
         self.worker.start()
+        self.update_selection_controls()
 
     def processing_finished(self) -> None:
         self.set_busy(False)
@@ -486,7 +792,7 @@ class MainWindow(QMainWindow):
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
             if item.data(USER_ROLE) == raw_path:
-                item.setText(f"{self._status_text(result.status)} · {Path(raw_path).name}")
+                item.setText(f"{self._status_text(result.status)}   ·   {Path(raw_path).name}")
                 break
         current = self.selected_path()
         if current and str(current) == raw_path:
@@ -497,6 +803,7 @@ class MainWindow(QMainWindow):
             if result.debug_dir:
                 message += f" 단계별 캡처 저장: {result.debug_dir}"
             self.status.setText(message)
+        self.update_selection_controls()
 
     @staticmethod
     def _status_text(status: str) -> str:
@@ -507,12 +814,14 @@ class MainWindow(QMainWindow):
         if path:
             self.display_path(path)
         else:
+            self.preview_filename.setText("사진을 선택하세요")
             self.source_preview.show_image(None)
             self.result_preview.show_image(None)
             self.open_diagnostics_button.setEnabled(False)
             self.recognition_enhance_button.setEnabled(False)
 
     def display_path(self, path: Path) -> None:
+        self.preview_filename.setText(path.name)
         self.source_preview.show_image(path)
         raw_path = str(path)
         result = self.results.get(raw_path)
@@ -527,7 +836,9 @@ class MainWindow(QMainWindow):
             self.open_diagnostics_button.setEnabled(bool(result.debug_dir and result.debug_dir.is_dir()))
         else:
             self.open_diagnostics_button.setEnabled(False)
-        self.recognition_enhance_button.setEnabled(path.is_file())
+        busy = self.is_busy
+        self.recognition_enhance_button.setEnabled(path.is_file() and not busy)
+        self.update_selection_controls()
 
     @staticmethod
     def _recognition_output_path(input_path: Path, output_dir: Path) -> Path:
@@ -596,26 +907,139 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.debug_dir.resolve())))
 
-    def print_selected(self) -> None:
-        path = self.selected_path()
-        result = self.results.get(str(path)) if path else None
-        recognition_path = self.recognition_outputs.get(str(path)) if path else None
-        print_path = (recognition_path if recognition_path and recognition_path.is_file()
-                      else result.output_path if result else None)
-        if not print_path or not print_path.is_file():
+    def _start_print_attempt(self, scope_label: str, paths: list[Path]) -> Path | None:
+        self.last_print_log_error = None
+        output_dir = Path(self.output_edit.text()).expanduser()
+        timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        log_path = output_dir / "print_logs" / f"print_{stamp}_{uuid4().hex[:8]}.json"
+        self._active_print_attempt = {
+            "path": log_path,
+            "write_error": None,
+            "data": {
+                "log_version": 1,
+                "attempt_id": log_path.stem,
+                "started_at": timestamp,
+                "scope": scope_label,
+                "requested_count": len(paths),
+                "requested_files": [
+                    {"order": index + 1, "source_path": str(path.resolve())}
+                    for index, path in enumerate(paths)
+                ],
+                "files": [],
+                "pages": [],
+                "events": [],
+                "physical_print_confirmed": False,
+            },
+        }
+        self._record_print_event("attempt_started")
+        return log_path
+
+    def _save_print_attempt_log(self) -> None:
+        attempt = self._active_print_attempt
+        if not attempt or attempt["write_error"]:
+            return
+        try:
+            path: Path = attempt["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(attempt["data"], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            attempt["write_error"] = f"{type(exc).__name__}: {exc}"
+
+    def _record_print_event(self, event: str, **details) -> None:
+        attempt = self._active_print_attempt
+        if not attempt:
+            return
+        attempt["data"]["events"].append({
+            "time": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "event": event,
+            **details,
+        })
+        self._save_print_attempt_log()
+
+    def _finish_print_attempt(self, status: str, **details) -> Path | None:
+        attempt = self._active_print_attempt
+        if not attempt:
+            return None
+        data = attempt["data"]
+        data["status"] = status
+        data["finished_at"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        data.update(details)
+        self._record_print_event("attempt_finished", status=status, **details)
+        self._save_print_attempt_log()
+        if attempt["write_error"]:
+            data["log_write_error"] = attempt["write_error"]
+            self.last_print_log_error = attempt["write_error"]
+        path = attempt["path"]
+        self._active_print_attempt = None
+        return path
+
+    def print_selected(
+        self, paths: list[Path] | None = None, scope_label: str = "선택한",
+    ) -> None:
+        paths = self.selected_paths() if paths is None else paths
+        job_log_path = self._start_print_attempt(scope_label, paths)
+        if not paths:
+            self._finish_print_attempt("no_files")
             QMessageBox.warning(
-                self, "인쇄할 결과 없음",
-                "먼저 선택 항목 보정/전체 보정 또는 인식 보정 버튼을 눌러 결과를 만드세요.",
+                self, "인쇄할 사진이 없습니다", "인쇄할 사진이 목록에 없습니다."
+            )
+            return
+
+        print_items: list[tuple[Path, CropResult | None, Path]] = []
+        missing: list[Path] = []
+        for source_path in paths:
+            result = self.results.get(str(source_path))
+            print_path = self._printable_path(source_path)
+            if print_path:
+                print_items.append((source_path, result, print_path))
+            else:
+                missing.append(source_path)
+        if self._active_print_attempt:
+            self._active_print_attempt["data"]["files"] = [
+                {
+                    "order": index + 1,
+                    "source_path": str(source_path.resolve()),
+                    "source_exists": source_path.is_file(),
+                    "result_status": result.status if result else "not_processed",
+                    "result_path": str(result.output_path) if result and result.output_path else None,
+                    "print_path": str(print_path) if print_path else None,
+                    "print_file_exists": bool(print_path and print_path.is_file()),
+                    "missing_print_result": print_path is None,
+                }
+                for index, source_path in enumerate(paths)
+                for result in [self.results.get(str(source_path))]
+                for print_path in [self._printable_path(source_path)]
+            ]
+            self._record_print_event(
+                "files_resolved", ready_count=len(print_items), missing_count=len(missing),
+            )
+        if missing:
+            names = "\n".join(path.name for path in missing[:5])
+            extra = f"\n외 {len(missing) - 5}개" if len(missing) > 5 else ""
+            QMessageBox.warning(
+                self, "보정 결과가 없는 사진",
+                f"{scope_label} {len(paths)}개 중 {len(missing)}개에 인쇄할 결과가 없습니다.\n"
+                f"먼저 해당 사진을 보정하세요.\n\n{names}{extra}",
+            )
+            self._finish_print_attempt(
+                "missing_print_results",
+                missing_files=[str(path.resolve()) for path in missing],
             )
             return
 
         available = QPrinterInfo.availablePrinterNames()
+        self._record_print_event("printers_discovered", available_printers=available)
         if not available:
             QMessageBox.critical(
                 self, "프린터를 찾을 수 없음",
                 "운영체제에서 사용할 수 있는 프린터를 찾지 못했습니다. "
                 "SELPHY 드라이버 설치와 프린터 연결을 확인하세요.",
             )
+            self._finish_print_attempt("no_printer_available")
             return
 
         preferred_name = _preferred_printer_name()
@@ -625,7 +1049,7 @@ class MainWindow(QMainWindow):
         # Use an app-owned confirmation dialog so the required C/landscape
         # settings are explicit and applied consistently on every print.
         dialog = QDialog(self)
-        dialog.setWindowTitle("SELPHY 인쇄 설정")
+        dialog.setWindowTitle(f"{scope_label} {len(print_items)}개 사진 인쇄")
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         form = QFormLayout(dialog)
         printer_combo = QComboBox(dialog)
@@ -633,9 +1057,18 @@ class MainWindow(QMainWindow):
         if preferred_name in available:
             printer_combo.setCurrentText(preferred_name)
         form.addRow("프린터", printer_combo)
+        form.addRow("인쇄 매수", QLabel(f"{len(print_items)}장 · 사진마다 한 장씩"))
         form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
         form.addRow("방향", QLabel("가로"))
         form.addRow("인쇄 영역", QLabel("C 용지 전체 채움 (86 × 54 mm)"))
+        self._record_print_event(
+            "print_dialog_opened",
+            candidate_printer=preferred_name,
+            expected_pages=len(print_items),
+            media="C Size",
+            orientation="Landscape",
+            full_page_fill=True,
+        )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
         preferences_button.clicked.connect(
@@ -650,19 +1083,21 @@ class MainWindow(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._finish_print_attempt("cancelled_in_print_dialog")
             return
 
         selected_printer = printer_combo.currentText()
         settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
         settings.setValue("printing/last_printer", selected_printer)
         settings.sync()
+        self._record_print_event("printer_selected", printer_name=selected_printer)
 
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setPrinterName(selected_printer)
         _set_c_landscape_default(printer)
-        printer.setDocName(print_path.stem)
+        printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Fill the complete 86 x 54 mm C-size sheet. The saved JPG is 81 x 51 mm;
+        # Fill the complete 86 x 54 mm C-size sheet. The saved JPG is 81 x 52 mm;
         # it is scaled to the paper edges here so the print has no app-added
         # white border. The selected media/orientation are reapplied each job.
         printer.setFullPage(True)
@@ -673,82 +1108,205 @@ class MainWindow(QMainWindow):
             abs(paper_mm.width() - 86.0) <= 0.5
             and abs(paper_mm.height() - 54.0) <= 0.5
         )
+        printer_geometry = {
+            "printer_name": selected_printer,
+            "printer_state_before_job": printer.printerState().name,
+            "resolution_dpi": printer.resolution(),
+            "paper_rect_mm": [paper_mm.x(), paper_mm.y(), paper_mm.width(), paper_mm.height()],
+            "paper_rect_device_px": [paper.x(), paper.y(), paper.width(), paper.height()],
+            "page_rect_device_px": [page.x(), page.y(), page.width(), page.height()],
+            "orientation_expected": "Landscape",
+            "c_landscape_detected": is_c_landscape,
+        }
+        if self._active_print_attempt:
+            self._active_print_attempt["data"]["printer"] = printer_geometry
+        self._record_print_event("printer_geometry_read", **printer_geometry)
         if not is_c_landscape or paper.width() <= 0 or paper.height() <= 0:
-            self._write_print_log(result, {
-                "status": "wrong_paper_size_or_orientation",
-                "printer_name": printer.printerName(),
-                "reported_paper_rect_mm": [paper_mm.x(), paper_mm.y(),
-                                            paper_mm.width(), paper_mm.height()],
-                "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
-                "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
-                "printer_resolution_dpi": printer.resolution(),
-            })
+            for source_path, item_result, _ in print_items:
+                self._write_print_log(item_result, {
+                    "status": "wrong_paper_size_or_orientation",
+                    "printer_name": printer.printerName(),
+                    "reported_paper_rect_mm": [paper_mm.x(), paper_mm.y(),
+                                                paper_mm.width(), paper_mm.height()],
+                    "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
+                    "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
+                    "printer_resolution_dpi": printer.resolution(),
+                    "source": str(source_path),
+                    "batch_count": len(print_items),
+                })
             QMessageBox.warning(
                 self, "용지 방향 확인",
                 "프린터가 86 × 54mm C 용지 가로 방향을 적용하지 않았습니다.\n"
                 f"프린터가 보고한 크기: {paper_mm.width():.1f} × {paper_mm.height():.1f}mm\n"
                 "SELPHY 드라이버에서 C 용지와 가로 방향을 선택하고 다시 인쇄하세요.",
             )
+            self._finish_print_attempt("printer_media_mismatch")
             return
 
-        image = QImage(str(print_path))
-        if image.isNull():
-            self._write_print_log(result, {
-                "status": "failed_to_load_image",
-                "printer_name": printer.printerName(),
-            })
-            QMessageBox.critical(self, "인쇄 오류", "보정 이미지를 열 수 없습니다.")
-            return
+        loaded_items: list[tuple[Path, CropResult | None, Path]] = []
+        for source_path, item_result, print_path in print_items:
+            reader = QImageReader(str(print_path))
+            if not reader.canRead():
+                self._write_print_log(item_result, {
+                    "status": "failed_to_load_image",
+                    "printer_name": printer.printerName(),
+                    "source": str(source_path),
+                    "output_path": str(print_path),
+                    "batch_count": len(print_items),
+                    "error": reader.errorString(),
+                })
+                QMessageBox.critical(
+                    self, "인쇄 오류", f"이미지를 열 수 없습니다.\n{print_path.name}"
+                )
+                self._finish_print_attempt(
+                    "image_load_failed", failed_path=str(print_path),
+                    image_reader_error=reader.errorString(),
+                )
+                return
+            image_size = reader.size()
+            self._record_print_event(
+                "image_readable", path=str(print_path),
+                width_px=image_size.width(), height_px=image_size.height(),
+            )
+            loaded_items.append((source_path, item_result, print_path))
+
+        if self._active_print_attempt:
+            self._active_print_attempt["data"]["expected_page_count"] = len(loaded_items)
+            self._active_print_attempt["data"]["target_rect_device_px"] = [
+                paper.x(), paper.y(), paper.width(), paper.height(),
+            ]
+
         target = QRectF(paper)
         painter = QPainter()
         if not painter.begin(printer):
             state = printer.printerState()
-            self._write_print_log(result, {
-                "status": "painter_begin_failed",
-                "printer_name": printer.printerName(),
-                "printer_state": state.name,
-            })
+            for source_path, item_result, _ in loaded_items:
+                self._write_print_log(item_result, {
+                    "status": "painter_begin_failed",
+                    "printer_name": printer.printerName(),
+                    "printer_state": state.name,
+                    "source": str(source_path),
+                    "batch_count": len(loaded_items),
+                })
             QMessageBox.critical(self, "인쇄 오류", "프린터 작업을 시작하지 못했습니다.")
+            self._finish_print_attempt(
+                "painter_begin_failed", printer_state=state.name,
+            )
             return
+        self._record_print_event("painter_started", expected_pages=len(loaded_items))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.drawImage(target, image)
+        rendered_count = 0
+        page_error = False
+        page_failure = None
+        for index, (source_path, item_result, print_path) in enumerate(loaded_items):
+            image = QImage(str(print_path))
+            if image.isNull():
+                page_error = True
+                page_failure = {"page_number": index + 1, "reason": "image_load_failed",
+                                "path": str(print_path)}
+                break
+            new_page_called = index > 0
+            new_page_succeeded = not new_page_called or printer.newPage()
+            if not new_page_succeeded:
+                page_error = True
+                page_failure = {"page_number": index + 1, "reason": "new_page_failed"}
+                break
+            painter.drawImage(target, image)
+            rendered_count += 1
+            page_details = {
+                "page_number": index + 1,
+                "source_path": str(source_path.resolve()),
+                "image_path": str(print_path),
+                "image_size_px": [image.width(), image.height()],
+                "new_page_called": new_page_called,
+                "new_page_succeeded": new_page_succeeded,
+                "draw_called": True,
+            }
+            if self._active_print_attempt:
+                self._active_print_attempt["data"]["pages"].append(page_details)
+            self._record_print_event("page_drawn", **page_details)
+            del image
         ended = painter.end()
         state = printer.printerState()
-        succeeded = ended and state != QPrinter.PrinterState.Aborted
-        self._write_print_log(result, {
-            "status": "sent_to_spooler" if succeeded else "print_job_failed",
-            "printer_name": printer.printerName(),
-            "printer_state": state.name,
-            "painter_end": ended,
-            "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
-            "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
-            "target_rect_px": [target.x(), target.y(), target.width(), target.height()],
-            "printer_resolution_dpi": printer.resolution(),
-            "page_size_mm": [86.0, 54.0],
-            "reported_paper_size_mm": [paper_mm.width(), paper_mm.height()],
-            "media": "C card (54 x 86 mm)",
-            "orientation": "landscape",
-            "image_target_mm": [86.0, 54.0],
-            "layout": "fill_entire_paper",
-        })
+        succeeded = (
+            ended and not page_error and rendered_count == len(loaded_items)
+            and state != QPrinter.PrinterState.Aborted
+        )
+        finished_log_path = self._finish_print_attempt(
+            "sent_to_spooler" if succeeded else "print_job_failed",
+            printer_name=selected_printer,
+            printer_state_after_job=state.name,
+            painter_end_succeeded=ended,
+            expected_page_count=len(loaded_items),
+            rendered_page_count=rendered_count,
+            page_failure=page_failure,
+            spooler_submission_confirmed=succeeded,
+            physical_print_confirmed=False,
+        )
+        for index, (source_path, item_result, print_path) in enumerate(loaded_items):
+            item_sent = succeeded and index < rendered_count
+            try:
+                self._write_print_log(item_result, {
+                    "status": "sent_to_spooler" if item_sent else "print_job_failed",
+                    "printer_name": printer.printerName(),
+                    "printer_state": state.name,
+                    "painter_end": ended,
+                    "paper_rect_px": [paper.x(), paper.y(), paper.width(), paper.height()],
+                    "page_rect_px": [page.x(), page.y(), page.width(), page.height()],
+                    "target_rect_px": [target.x(), target.y(), target.width(), target.height()],
+                    "printer_resolution_dpi": printer.resolution(),
+                    "page_size_mm": [86.0, 54.0],
+                    "reported_paper_size_mm": [paper_mm.width(), paper_mm.height()],
+                    "media": "C card (54 x 86 mm)",
+                    "orientation": "landscape",
+                    "image_target_mm": [86.0, 54.0],
+                    "layout": "fill_entire_paper",
+                    "source": str(source_path),
+                    "output_path": str(print_path),
+                    "page_number": index + 1,
+                    "batch_count": len(loaded_items),
+                    "job_log": str(finished_log_path or job_log_path),
+                })
+            except OSError as exc:
+                self._record_print_event(
+                    "per_image_log_write_failed", source_path=str(source_path),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
         if not succeeded:
+            log_message = f"인쇄 로그: {finished_log_path or job_log_path}"
+            if self.last_print_log_error:
+                log_message += f"\n로그 저장 오류: {self.last_print_log_error}"
             QMessageBox.critical(
                 self, "인쇄 오류",
                 f"인쇄 작업 전송에 실패했습니다. 프린터 상태: {state.name}\n"
-                "단계별 진단 폴더의 print_attempt.json을 확인하세요.",
+                f"{log_message}",
             )
             return
-        self.status.setText("인쇄 작업을 프린터로 보냈습니다. 프린터 드라이버에서 카드 용지와 테두리 설정을 확인하세요.")
+        if self.last_print_log_error:
+            self.status.setText(
+                f"{len(loaded_items)}개 사진을 인쇄 대기열로 보냈습니다. "
+                f"로그 저장 실패: {self.last_print_log_error}"
+            )
+        else:
+            self.status.setText(
+                f"{len(loaded_items)}개 사진을 인쇄 대기열로 보냈습니다. "
+                f"인쇄 로그: {finished_log_path or job_log_path}"
+            )
 
-    def handle_print_clicked(self) -> None:
+    def handle_print_clicked(
+        self, paths: list[Path] | None = None, scope_label: str = "선택한",
+    ) -> None:
         """Make failures before the print dialog visible in packaged builds."""
         self.status.setText("인쇄 버튼이 눌렸습니다. 프린터와 출력 파일을 확인하고 있습니다…")
         QApplication.processEvents()
         try:
-            self.print_selected()
+            self.print_selected(paths, scope_label)
         except Exception as exc:
             message = f"인쇄 창을 여는 중 오류가 발생했습니다: {type(exc).__name__}: {exc}"
             self.status.setText(message)
+            self._finish_print_attempt(
+                "exception", error_type=type(exc).__name__, error=str(exc),
+            )
             QMessageBox.critical(self, "인쇄 창을 열 수 없음", message)
 
     def save_printer_preferences(self, printer_name: str, parent: QDialog) -> None:
@@ -786,19 +1344,145 @@ class MainWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
 
+    def open_print_logs(self) -> None:
+        folder = Path(self.output_edit.text()).expanduser() / "print_logs"
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve())))
+
+    @staticmethod
+    def _find_photoshop_executable() -> Path | None:
+        configured = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).value(
+            "editing/photoshop_executable", "",
+        )
+        if configured and Path(str(configured)).is_file():
+            return Path(str(configured))
+
+        if sys.platform == "win32":
+            import winreg
+
+            registry_paths = (
+                (winreg.HKEY_CURRENT_USER,
+                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe"),
+            )
+            for root, key_path in registry_paths:
+                try:
+                    with winreg.OpenKey(root, key_path) as key:
+                        executable = Path(winreg.QueryValueEx(key, None)[0])
+                    if executable.is_file():
+                        return executable
+                except (OSError, ValueError):
+                    continue
+            for variable in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+                base = os.environ.get(variable)
+                if not base:
+                    continue
+                matches = sorted(
+                    Path(base).glob("Adobe/Adobe Photoshop*/Photoshop.exe"),
+                    reverse=True,
+                )
+                if matches:
+                    return matches[0]
+        elif sys.platform == "darwin":
+            apps = sorted(
+                Path("/Applications").glob(
+                    "Adobe Photoshop*.app/Contents/MacOS/Adobe Photoshop",
+                ),
+                reverse=True,
+            )
+            if apps:
+                return apps[0]
+        return None
+
+    def edit_selected_images(self) -> None:
+        sources = self.selected_paths()
+        if not sources:
+            QMessageBox.information(self, "사진을 선택하세요", "수정할 사진을 체크하세요.")
+            return
+        image_paths = [self._printable_path(source) or source for source in sources]
+        image_paths = [path for path in image_paths if path.is_file()]
+        if not image_paths:
+            QMessageBox.warning(self, "열 사진이 없습니다", "선택한 사진 파일을 찾을 수 없습니다.")
+            return
+        executable = self._find_photoshop_executable()
+        if executable is None and sys.platform == "win32":
+            selected, _ = QFileDialog.getOpenFileName(
+                self, "Photoshop 실행 파일 선택", "",
+                "Photoshop (Photoshop.exe);;실행 파일 (*.exe)",
+            )
+            if not selected:
+                return
+            executable = Path(selected)
+            QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).setValue(
+                "editing/photoshop_executable", str(executable),
+            )
+            QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).sync()
+        if executable is None:
+            QMessageBox.warning(
+                self, "Photoshop을 찾을 수 없음",
+                "Photoshop 설치 경로를 찾지 못했습니다. Photoshop을 설치했는지 확인하세요.",
+            )
+            return
+        self.pending_photoshop_paths = image_paths
+        self.photoshop_executable = executable
+        self.photoshop_launch_pending = True
+        self.update_selection_controls()
+        self.status.setText(f"Photoshop에서 {len(image_paths)}개 사진을 순서대로 여는 중입니다…")
+        self._launch_next_photoshop_image()
+
+    def _launch_next_photoshop_image(self) -> None:
+        if not self.pending_photoshop_paths:
+            self.photoshop_launch_pending = False
+            self.update_selection_controls()
+            self.status.setText("선택한 사진을 모두 Photoshop에 열었습니다.")
+            return
+        image_path = self.pending_photoshop_paths.pop(0)
+        try:
+            if sys.platform == "darwin":
+                app_path = self.photoshop_executable.parent.parent.parent
+                subprocess.Popen(["open", "-a", str(app_path), str(image_path)])
+            else:
+                subprocess.Popen([str(self.photoshop_executable), str(image_path)])
+        except OSError as exc:
+            self.pending_photoshop_paths.clear()
+            self.photoshop_launch_pending = False
+            self.update_selection_controls()
+            QMessageBox.critical(
+                self, "Photoshop 실행 실패", f"이미지를 Photoshop에서 열지 못했습니다.\n{exc}",
+            )
+            return
+        if self.pending_photoshop_paths:
+            QTimer.singleShot(700, self._launch_next_photoshop_image)
+        else:
+            self.photoshop_launch_pending = False
+            self.update_selection_controls()
+            self.status.setText("선택한 사진을 모두 Photoshop에 열었습니다.")
+
     def set_busy(self, busy: bool) -> None:
+        self.is_busy = busy
         for button in (self.add_files_button, self.add_folder_button, self.remove_button,
-                       self.process_selected_button, self.process_all_button, self.print_button,
-                       self.recognition_enhance_button):
+                       self.remove_all_button,
+                       self.process_selected_button, self.process_all_button,
+                       self.clear_selection_button,
+                       self.print_button, self.print_all_button, self.edit_selected_button,
+                       self.recognition_enhance_button, self.open_print_logs_button,
+                       self.output_browse_button):
             button.setEnabled(not busy)
+        self.output_edit.setEnabled(not busy)
+        self.file_list.setEnabled(not busy)
+        self.select_all_checkbox.setEnabled(not busy and self.file_list.count() > 0)
         if not busy:
             path = self.selected_path()
             self.recognition_enhance_button.setEnabled(bool(path and path.is_file()))
+            self.update_selection_controls()
 
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("신분증 스캔 보정 및 인쇄")
+    app.setApplicationName("셀피 카드 스튜디오")
     window = MainWindow()
     window.show()
     raise SystemExit(app.exec())

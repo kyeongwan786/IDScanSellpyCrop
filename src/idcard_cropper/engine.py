@@ -75,13 +75,13 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         "algorithm": "id_card_crop.process_image_data",
         "target_cm": [8.1, 5.2],
         "dpi": 300,
-        "shrink_fraction": 0.0,
+        "shrink_fraction": 0.03,
     }
 
     try:
         image = _load_image(source)
         result = card_algorithm.process_image_data(
-            image, source_path=source, dpi=300, shrink=0.0, verbose=False,
+            image, source_path=source, dpi=300, shrink=0.03, verbose=False,
         )
         if result is None:
             info.update(status="manual_review", message="신분증 외곽을 찾지 못했습니다.")
