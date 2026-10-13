@@ -363,7 +363,7 @@ def flatten_and_refine(img, quad, iters=2):
 
 
 def crop_from_flat(img, q, out_w, out_h, shrink):
-    """평면 좌표계에서 안쪽 여백을 준 뒤, 원본에서 한 번에 8.1x5.2 로 변환(재샘플링 1회)"""
+    """평면 좌표계에서 안쪽 여백 없이 원본을 8.4x5.6으로 변환(재샘플링 1회)"""
     flat_c = flat_dst()
     c = flat_c.mean(axis=0)
     inner = (c + (flat_c - c) * (1 - shrink)).astype("float32")

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-신분증 사진 -> 8.1cm x 5.2cm (셀피 인쇄용) 자동 크롭/펴기
+신분증 사진 -> 8.4cm x 5.6cm (셀피 인쇄용) 자동 크롭/펴기
 
 - 어떤 배경(흰색/검정/나무/카펫 등)이든 신분증 사각형을 자동 감지
-- 기울어짐/회전/원근 왜곡을 펴서 신분증이 8.1x5.2cm 캔버스에 꽉 차게 저장
+- 기울어짐/회전/원근 왜곡을 펴서 신분증이 8.4x5.6cm 캔버스에 꽉 차게 저장
 - 얼굴 사진 위치로 180도 뒤집힘 자동 보정 (OpenCV 얼굴 검출)
-- DPI 정보를 파일에 넣어 인쇄 시 실제 크기가 8.1x5.2cm 가 되도록 함
+- DPI 정보를 파일에 넣어 인쇄 시 실제 크기가 8.4x5.6cm 가 되도록 함
 
 설치:  pip install opencv-python pillow numpy
 
@@ -14,7 +14,7 @@
   python id_card_crop.py ./원본폴더 -o ./결과폴더    -> 폴더 일괄 처리
   python id_card_crop.py 사진.jpg --debug          -> 감지 영역 표시 *_debug.jpg 도 저장
   python id_card_crop.py 사진.jpg --rotate 180     -> 방향이 틀리면 수동 회전
-  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.03)
+  python id_card_crop.py 사진.jpg --shrink 0.05    -> 안쪽 여백 조절 (기본 0.0, 꽉 채움)
 """
 import argparse
 import os
@@ -24,8 +24,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-TARGET_W_CM = 8.1
-TARGET_H_CM = 5.2
+TARGET_W_CM = 8.4
+TARGET_H_CM = 5.6
 CARD_RATIO = 85.6 / 53.98  # 신분증(ID-1) 가로세로비 ≈ 1.586
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 WORK = 1000.0  # 감지용 작업 해상도(긴 변)
@@ -1210,7 +1210,7 @@ def finalize_quad(img, quad, sil=None, verbose=False, f_px=None):
 
 
 def crop_from_flat(img, q, out_w, out_h, shrink):
-    """평면 좌표계에서 안쪽 여백을 준 뒤, 원본에서 한 번에 8.1x5.2 로 변환(재샘플링 1회)"""
+    """평면 좌표계에서 안쪽 여백 없이 원본을 8.4x5.6으로 변환(재샘플링 1회)"""
     flat_c = flat_dst()
     c = flat_c.mean(axis=0)
     inner = (c + (flat_c - c) * (1 - shrink)).astype("float32")
@@ -1297,7 +1297,7 @@ def auto_orient(card, return_rotation=False):
 
 
 # ------------------------------------------------------------------ 처리
-def process_image_data(img, source_path=None, dpi=300, shrink=0.03, rotate=None,
+def process_image_data(img, source_path=None, dpi=300, shrink=0.0, rotate=None,
                        verbose=False):
     """Run the single card-detection/flattening pipeline on an OpenCV BGR image."""
     quad, sil, score = find_card_quad(img, verbose=verbose, return_score=True)
@@ -1326,7 +1326,7 @@ def process_image_data(img, source_path=None, dpi=300, shrink=0.03, rotate=None,
     }
 
 
-def process(path, out_path, dpi=300, shrink=0.03, rotate=None, debug=False):
+def process(path, out_path, dpi=300, shrink=0.0, rotate=None, debug=False):
     img = load_image(path)
     result = process_image_data(img, source_path=path, dpi=dpi, shrink=shrink,
                                 rotate=rotate, verbose=debug)
@@ -1371,11 +1371,11 @@ def _process_task(tk):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="신분증 -> 8.1x5.2cm 셀피 인쇄용 자동 크롭")
+    ap = argparse.ArgumentParser(description="신분증 -> 8.4x5.6cm 셀피 인쇄용 자동 크롭")
     ap.add_argument("input", help="이미지 파일 또는 폴더")
     ap.add_argument("-o", "--output", help="출력 파일/폴더")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--shrink", type=float, default=0.03,
+    ap.add_argument("--shrink", type=float, default=0.0,
                     help="카드 가장자리에서 안쪽으로 줄이는 비율 (기본 0.03: 각 변 약 1.5%%/1.3mm "
                          "안쪽). 배경이 아직 보이면 0.05, 더 넓게 쓰려면 0.02")
     ap.add_argument("--rotate", type=int, choices=[0, 180], default=None,
