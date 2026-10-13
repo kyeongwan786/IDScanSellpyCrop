@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-신분증 사진 -> 8.4cm x 5.6cm (셀피 인쇄용) 자동 크롭/펴기
+신분증 사진 -> 8.1cm x 5.2cm (셀피 인쇄용) 자동 크롭/펴기
 
 - 어떤 배경(흰색/검정/나무/카펫 등)이든 신분증 사각형을 자동 감지
-- 기울어짐/회전/원근 왜곡을 펴서 신분증이 8.4x5.6cm 캔버스에 꽉 차게 저장
+- 기울어짐/회전/원근 왜곡을 펴서 신분증이 8.1x5.2cm 캔버스에 꽉 차게 저장
 - 얼굴 사진 위치로 180도 뒤집힘 자동 보정 (OpenCV 얼굴 검출)
-- DPI 정보를 파일에 넣어 인쇄 시 실제 크기가 8.4x5.6cm 가 되도록 함
+- DPI 정보를 파일에 넣어 인쇄 시 실제 크기가 8.1x5.2cm 가 되도록 함
 
 설치:  pip install opencv-python pillow numpy
 
@@ -24,8 +24,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-TARGET_W_CM = 8.4
-TARGET_H_CM = 5.6
+TARGET_W_CM = 8.1
+TARGET_H_CM = 5.2
 CARD_RATIO = 85.6 / 53.98  # 신분증(ID-1) 가로세로비 ≈ 1.586
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 WORK = 1000.0  # 감지용 작업 해상도(긴 변)
@@ -1210,7 +1210,7 @@ def finalize_quad(img, quad, sil=None, verbose=False, f_px=None):
 
 
 def crop_from_flat(img, q, out_w, out_h, shrink):
-    """평면 좌표계에서 안쪽 여백 없이 원본을 8.4x5.6으로 변환(재샘플링 1회)"""
+    """평면 좌표계에서 안쪽 여백 없이 원본을 8.1x5.2로 변환(재샘플링 1회)"""
     flat_c = flat_dst()
     c = flat_c.mean(axis=0)
     inner = (c + (flat_c - c) * (1 - shrink)).astype("float32")
@@ -1371,7 +1371,7 @@ def _process_task(tk):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="신분증 -> 8.4x5.6cm 셀피 인쇄용 자동 크롭")
+    ap = argparse.ArgumentParser(description="신분증 -> 8.1x5.2cm 셀피 인쇄용 자동 크롭")
     ap.add_argument("input", help="이미지 파일 또는 폴더")
     ap.add_argument("-o", "--output", help="출력 파일/폴더")
     ap.add_argument("--dpi", type=int, default=300)
