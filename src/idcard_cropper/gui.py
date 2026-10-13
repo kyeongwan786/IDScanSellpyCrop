@@ -11,7 +11,7 @@ import sys
 from uuid import uuid4
 
 import cv2
-from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QUrl, QSize, QSizeF, QSettings, QEvent,
+from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSizeF, QSettings, QEvent,
                             QTimer,
                             QPoint, QMimeData)
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
@@ -198,11 +198,14 @@ class ClearCheckBox(QCheckBox):
         rect = self.style().subElementRect(
             QStyle.SubElement.SE_CheckBoxIndicator, option, self,
         )
-        side = max(18, min(rect.width(), rect.height()))
-        rect.setSize(QSize(side, side))
-        rect.moveCenter(self.style().subElementRect(
-            QStyle.SubElement.SE_CheckBoxIndicator, option, self,
-        ).center())
+        if not rect.isValid() or rect.isEmpty():
+            rect = QRect(0, (self.height() - 20) // 2, 20, 20)
+            if option.direction == Qt.LayoutDirection.RightToLeft:
+                rect.moveRight(self.width())
+        else:
+            center = rect.center()
+            rect = QRect(0, 0, 20, 20)
+            rect.moveCenter(center)
         _paint_check_mark(self, rect, self.checkState())
 
 
@@ -216,14 +219,17 @@ class ClearCheckDelegate(QStyledItemDelegate):
         item_option = QStyleOptionViewItem(option)
         item_option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
         item_option.checkState = index.data(Qt.ItemDataRole.CheckStateRole)
+        if not option.widget:
+            return
         rect = option.widget.style().subElementRect(
             QStyle.SubElement.SE_ItemViewItemCheckIndicator, item_option, option.widget,
         )
-        side = max(18, min(rect.width(), rect.height()))
-        rect.setSize(QSize(side, side))
-        rect.moveCenter(option.widget.style().subElementRect(
-            QStyle.SubElement.SE_ItemViewItemCheckIndicator, item_option, option.widget,
-        ).center())
+        if not rect.isValid() or rect.isEmpty():
+            rect = QRect(option.rect.left() + 4, option.rect.center().y() - 10, 20, 20)
+        else:
+            center = rect.center()
+            rect = QRect(0, 0, 20, 20)
+            rect.moveCenter(center)
         _paint_check_mark(painter, rect, index.data(Qt.ItemDataRole.CheckStateRole))
 
 
@@ -234,17 +240,16 @@ def _paint_check_mark(painter_or_widget, rect, check_state) -> None:
     checked = check_state == Qt.CheckState.Checked
     partial = check_state == Qt.CheckState.PartiallyChecked
     if checked:
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#078b88"))
-        painter.drawRoundedRect(rect, 4, 4)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
         pen = painter.pen()
         pen.setStyle(Qt.PenStyle.SolidLine)
-        pen.setColor(QColor("#ffffff"))
-        pen.setWidthF(2.2)
+        pen.setColor(QColor("#078b88"))
+        pen.setWidthF(1.8)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 4, 4)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawLine(
             QPoint(round(rect.left() + rect.width() * 0.23), round(rect.top() + rect.height() * 0.53)),
             QPoint(round(rect.left() + rect.width() * 0.43), round(rect.top() + rect.height() * 0.72)),
@@ -254,8 +259,12 @@ def _paint_check_mark(painter_or_widget, rect, check_state) -> None:
             QPoint(round(rect.left() + rect.width() * 0.78), round(rect.top() + rect.height() * 0.30)),
         )
     else:
-        painter.setPen(QColor("#78869b") if not partial else QColor("#078b88"))
-        painter.setBrush(QColor("#ffffff") if not partial else QColor("#e2f3f0"))
+        pen = painter.pen()
+        pen.setStyle(Qt.PenStyle.SolidLine)
+        pen.setColor(QColor("#58677d") if not partial else QColor("#078b88"))
+        pen.setWidthF(1.8)
+        painter.setPen(pen)
+        painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 4, 4)
         if partial:
             pen = painter.pen()
@@ -600,7 +609,7 @@ class MainWindow(QMainWindow):
             QListWidget#photoList { background: transparent; border: none; outline: none; }
             QListWidget#photoList::item { border: 1px solid #e1e6ed; border-radius: 9px; padding: 13px 9px; margin: 1px 0; }
             QListWidget#photoList::item:hover { border-color: #98c9c6; }
-            QListWidget#photoList::item:selected { background: #e2edff; border-color: #4b83df; color: #17345f; }
+            QListWidget#photoList::item:selected { background: #ffffff; border-color: #078b88; color: #34435d; }
             QCheckBox { color: #34435d; spacing: 8px; }
             QPushButton { background: #ffffff; color: #34435d; border: 1px solid #d6dde7; border-radius: 8px; padding: 8px 12px; }
             QPushButton:hover { background: #f2f7f7; border-color: #94c9c5; }
@@ -695,15 +704,14 @@ class MainWindow(QMainWindow):
         self.update_selection_controls()
 
     def _style_list_item(self, item: QListWidgetItem) -> None:
-        checked = item.checkState() == Qt.CheckState.Checked
         label = item.data(LIST_LABEL_ROLE) or ""
         old_blocked = self.file_list.blockSignals(True)
         try:
             display_text = label
             if item.text() != display_text:
                 item.setText(display_text)
-            background = QColor("#e4f4ef") if checked else QColor("#ffffff")
-            foreground = QColor("#075b55") if checked else QColor("#34435d")
+            background = QColor("#ffffff")
+            foreground = QColor("#34435d")
             if item.background().color() != background:
                 item.setBackground(background)
             if item.foreground().color() != foreground:
