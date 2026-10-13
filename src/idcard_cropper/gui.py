@@ -15,6 +15,7 @@ from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSi
                             QTimer,
                             QPoint, QMimeData)
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
+                           QPalette,
                            QKeySequence, QPixmap, QShortcut,
                            QPageLayout, QPageSize, QPainter)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
@@ -190,6 +191,21 @@ class CheckablePhotoList(QListWidget):
 class ConsistentCheckStyle(QProxyStyle):
     """Use one checkbox drawing for both the list and the select-all control."""
 
+    def subElementRect(self, element, option, widget=None):  # noqa: N802
+        rect = super().subElementRect(element, option, widget)
+        if element in (
+            QStyle.SubElement.SE_CheckBoxIndicator,
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator,
+        ):
+            if rect.isValid() and not rect.isEmpty():
+                center_x = rect.center().x()
+                center_y = rect.center().y()
+            else:
+                center_x = option.rect.left() + 10
+                center_y = option.rect.center().y()
+            return QRect(center_x - 10, center_y - 10, 20, 20)
+        return rect
+
     def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802
         if element in (
             QStyle.PrimitiveElement.PE_IndicatorCheckBox,
@@ -206,10 +222,32 @@ class ConsistentCheckStyle(QProxyStyle):
         super().drawPrimitive(element, option, painter, widget)
 
 
+class SelectAllCheckBox(QCheckBox):
+    """Keep the select-all mark fully visible and aligned with list checks."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.setMinimumHeight(26)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        painter = QPainter(self)
+        rect = QRect(2, (self.height() - 20) // 2 + 2, 20, 20)
+        _paint_check_mark(painter, rect, self.checkState())
+        text_color = self.palette().color(QPalette.ColorRole.WindowText)
+        if not self.isEnabled():
+            text_color = QColor("#9aa4b4")
+        painter.setPen(text_color)
+        painter.drawText(
+            QRect(30, 0, max(0, self.width() - 30), self.height()),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self.text(),
+        )
+        painter.end()
+
+
 def _paint_check_mark(painter, rect, check_state) -> None:
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    rect = QRect(rect.left(), rect.center().y() - 10, 20, 20)
     checked = check_state == Qt.CheckState.Checked
     partial = check_state == Qt.CheckState.PartiallyChecked
     if checked:
@@ -439,9 +477,7 @@ class MainWindow(QMainWindow):
         list_header.addWidget(self.add_folder_button)
         list_layout.addLayout(list_header)
 
-        self.select_all_checkbox = QCheckBox("모두 선택")
-        self._select_all_check_style = ConsistentCheckStyle()
-        self.select_all_checkbox.setStyle(self._select_all_check_style)
+        self.select_all_checkbox = SelectAllCheckBox("모두 선택")
         self.select_all_checkbox.setTristate(True)
         list_layout.addWidget(self.select_all_checkbox)
         self.file_list = CheckablePhotoList()
