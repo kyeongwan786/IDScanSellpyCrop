@@ -14,8 +14,9 @@ import cv2
 from PySide6.QtCore import (Qt, QThread, Signal, QRectF, QUrl, QSize, QSizeF, QSettings, QEvent,
                             QTimer,
                             QPoint, QMimeData)
-from PySide6.QtGui import (QDesktopServices, QDrag, QIcon, QImage, QImageReader,
-                           QPageLayout, QPageSize, QPainter, QPixmap)
+from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
+                           QKeySequence, QPixmap, QShortcut,
+                           QPageLayout, QPageSize, QPainter)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,6 +35,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStyle,
+    QStyleOptionViewItem,
     QSizePolicy,
     QStackedWidget,
     QSplitter,
@@ -46,6 +49,7 @@ from .engine import CropResult, enhance_for_recognition, process_image
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 USER_ROLE = int(Qt.ItemDataRole.UserRole)
+LIST_LABEL_ROLE = USER_ROLE + 1
 SETTINGS_ORGANIZATION = "IDCardCropper"
 SETTINGS_APPLICATION = "IDCardCropper"
 DM_OUT_BUFFER = 0x00000002
@@ -152,11 +156,41 @@ def _save_windows_printer_preferences(printer_name: str, parent_window: int) -> 
         winspool.ClosePrinter(handle)
 
 
+class CheckablePhotoList(QListWidget):
+    """Toggle an item's check state when its row body is clicked."""
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        point = event.position().toPoint()
+        item = self.itemAt(point)
+        toggle_item = None
+        if (item and event.button() == Qt.MouseButton.LeftButton
+                and item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            option = QStyleOptionViewItem()
+            option.initFrom(self)
+            option.rect = self.visualItemRect(item)
+            option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+            option.checkState = item.checkState()
+            indicator = self.style().subElementRect(
+                QStyle.SubElement.SE_ItemViewItemCheckIndicator, option, self,
+            )
+            if not indicator.contains(point):
+                toggle_item = item
+
+        super().mousePressEvent(event)
+        if toggle_item:
+            next_state = (
+                Qt.CheckState.Unchecked
+                if toggle_item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            toggle_item.setCheckState(next_state)
+
+
 class Preview(QLabel):
     def __init__(self, title: str, *, allow_file_drag: bool = False) -> None:
         super().__init__(title)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(300, 260)
+        self.setMinimumSize(300, 380)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setObjectName("imagePreview")
         self.setStyleSheet(
@@ -168,18 +202,33 @@ class Preview(QLabel):
         self._allow_file_drag = allow_file_drag
         self._drag_origin: QPoint | None = None
         self._placeholder = title
+        self._zoom = 1.0
         if allow_file_drag:
-            self.setToolTip("이미지를 다른 앱으로 드래그하거나 더블클릭해 기본 사진 앱에서 여세요.")
+            self.setToolTip("마우스 휠로 확대·축소할 수 있습니다.")
 
     def show_image(self, path: Path | None) -> None:
         self._pixmap = QPixmap(str(path)) if path and path.is_file() else None
         self._file_path = Path(path).resolve() if self._pixmap and self._allow_file_drag else None
+        self._zoom = 1.0
         self._render()
 
     def show_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
         self._file_path = None
+        self._zoom = 1.0
         self._render()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if not self._pixmap or self._pixmap.isNull():
+            return super().wheelEvent(event)
+        delta = event.angleDelta().y()
+        if delta:
+            factor = 1.15 if delta > 0 else 1 / 1.15
+            self._zoom = min(4.0, max(0.35, self._zoom * factor))
+            self._render()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt callback name
         if (self._allow_file_drag and self._file_path
@@ -220,8 +269,19 @@ class Preview(QLabel):
 
     def _render(self) -> None:
         if self._pixmap and not self._pixmap.isNull():
-            self.setPixmap(self._pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation))
+            fit_size = QSize(max(1, self.width() - 28), max(1, self.height() - 28))
+            fitted = self._pixmap.scaled(
+                fit_size, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            zoomed_size = QSize(
+                max(1, round(fitted.width() * self._zoom)),
+                max(1, round(fitted.height() * self._zoom)),
+            )
+            self.setPixmap(fitted.scaled(
+                zoomed_size, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
         else:
             self.setPixmap(QPixmap())
             self.setText(self._placeholder)
@@ -245,11 +305,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("셀피 카드 스튜디오")
-        self.resize(1240, 820)
-        self.setMinimumSize(980, 680)
+        self.resize(1240, 900)
+        self.setMinimumSize(980, 740)
         self.setAcceptDrops(True)
         self.results: dict[str, CropResult] = {}
         self.recognition_outputs: dict[str, Path] = {}
+        self.recognition_undo_stack: list[tuple[str, Path | None]] = []
         self.worker: ProcessWorker | None = None
         self.pending_processing: list[Path] = []
         self.pending_photoshop_paths: list[Path] = []
@@ -316,7 +377,7 @@ class MainWindow(QMainWindow):
         self.select_all_checkbox = QCheckBox("모두 선택")
         self.select_all_checkbox.setTristate(True)
         list_layout.addWidget(self.select_all_checkbox)
-        self.file_list = QListWidget()
+        self.file_list = CheckablePhotoList()
         self.file_list.setObjectName("photoList")
         self.file_list.setMinimumWidth(320)
         self.file_list.setIconSize(QSize(52, 52))
@@ -379,12 +440,15 @@ class MainWindow(QMainWindow):
         preview_tools = QHBoxLayout()
         self.recognition_enhance_button = QPushButton("인식 보정")
         self.recognition_enhance_button.setToolTip(
-            "현재 사진에 밝기와 색 보정을 추가합니다. 새 크롭은 하지 않습니다."
+            "현재 사진의 색과 밝기를 보정합니다. 크롭은 하지 않습니다."
         )
+        self.undo_button = QPushButton("되돌리기")
+        self.undo_button.setToolTip("마지막 인식 보정을 되돌립니다 (Ctrl+Z).")
         self.open_diagnostics_button = QPushButton("단계별 진단")
         self.open_output_button = QPushButton("결과 폴더 열기")
         self.open_print_logs_button = QPushButton("인쇄 로그 열기")
         preview_tools.addWidget(self.recognition_enhance_button)
+        preview_tools.addWidget(self.undo_button)
         preview_tools.addStretch(1)
         preview_tools.addWidget(self.open_diagnostics_button)
         preview_tools.addWidget(self.open_output_button)
@@ -448,8 +512,9 @@ class MainWindow(QMainWindow):
             QLabel#dropHint { color: #778197; border: 1px dashed #c8d0dc; border-radius: 10px; padding: 12px; }
             QLineEdit { background: #ffffff; border: 1px solid #d6dde7; border-radius: 8px; padding: 8px 10px; color: #17233c; }
             QListWidget#photoList { background: transparent; border: none; outline: none; }
-            QListWidget#photoList::item { background: #ffffff; border: 1px solid #e1e6ed; border-radius: 9px; padding: 13px 9px; margin: 1px 0; color: #24324b; }
-            QListWidget#photoList::item:hover { border-color: #98c9c6; background: #f8fbfb; }
+            QListWidget#photoList::item { border: 1px solid #e1e6ed; border-radius: 9px; padding: 13px 9px; margin: 1px 0; }
+            QListWidget#photoList::item:hover { border-color: #98c9c6; }
+            QListWidget#photoList::item:selected { background: #e2edff; border-color: #4b83df; color: #17345f; }
             QCheckBox { color: #34435d; spacing: 8px; }
             QPushButton { background: #ffffff; color: #34435d; border: 1px solid #d6dde7; border-radius: 8px; padding: 8px 12px; }
             QPushButton:hover { background: #f2f7f7; border-color: #94c9c5; }
@@ -469,6 +534,7 @@ class MainWindow(QMainWindow):
         self.process_selected_button.clicked.connect(self.process_selected)
         self.process_all_button.clicked.connect(self.process_all)
         self.recognition_enhance_button.clicked.connect(self.enhance_selected_for_recognition)
+        self.undo_button.clicked.connect(self.undo_last_recognition_enhancement)
         self.file_list.currentItemChanged.connect(self.selection_changed)
         self.file_list.itemChanged.connect(self.selection_checks_changed)
         self.select_all_checkbox.toggled.connect(self.set_all_selected)
@@ -489,6 +555,13 @@ class MainWindow(QMainWindow):
         self.recognition_enhance_button.setEnabled(False)
         self.source_tab.setChecked(True)
         self.update_selection_controls()
+        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.undo_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.undo_shortcut.activated.connect(self.undo_last_recognition_enhancement)
+        self._update_undo_controls()
+        app = QApplication.instance()
+        if app:
+            app.focusChanged.connect(self._update_undo_controls)
 
         # Qt delivers drag events to the child widget under the pointer. Install
         # the same file-drop handler on the full UI so buttons, previews, and
@@ -516,22 +589,45 @@ class MainWindow(QMainWindow):
         for path in paths:
             resolved = str(path.resolve())
             if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES and resolved not in known:
-                item = QListWidgetItem(f"대기 중   ·   {path.name}")
+                item = QListWidgetItem()
                 item.setData(USER_ROLE, resolved)
+                item.setData(LIST_LABEL_ROLE, f"대기 중   ·   {path.name}")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked)
+                item.setCheckState(Qt.CheckState.Unchecked)
                 item.setIcon(QIcon(resolved))
                 item.setToolTip(resolved)
                 self.file_list.addItem(item)
+                self._style_list_item(item)
                 known.add(resolved)
                 added_paths.append(Path(resolved))
         if added_paths:
             self.file_list.setCurrentRow(self.file_list.count() - len(added_paths))
             self.status.setText(
-                f"{len(added_paths)}개 사진을 추가하고 선택했습니다."
+                f"{len(added_paths)}개 사진을 추가했습니다. 인쇄·수정할 사진은 체크하세요."
             )
         self.drop_hint.setVisible(self.file_list.count() == 0)
         self.update_selection_controls()
+
+    def _style_list_item(self, item: QListWidgetItem) -> None:
+        checked = item.checkState() == Qt.CheckState.Checked
+        label = item.data(LIST_LABEL_ROLE) or ""
+        old_blocked = self.file_list.blockSignals(True)
+        try:
+            display_text = label
+            if item.text() != display_text:
+                item.setText(display_text)
+            background = QColor("#e4f4ef") if checked else QColor("#ffffff")
+            foreground = QColor("#075b55") if checked else QColor("#34435d")
+            if item.background().color() != background:
+                item.setBackground(background)
+            if item.foreground().color() != foreground:
+                item.setForeground(foreground)
+        finally:
+            self.file_list.blockSignals(old_blocked)
+
+    def _set_list_item_label(self, item: QListWidgetItem, label: str) -> None:
+        item.setData(LIST_LABEL_ROLE, label)
+        self._style_list_item(item)
 
     @staticmethod
     def _dropped_image_paths(mime_data: QMimeData) -> list[Path]:
@@ -599,6 +695,7 @@ class MainWindow(QMainWindow):
                 raw_path = item.data(USER_ROLE)
                 self.results.pop(raw_path, None)
                 self.recognition_outputs.pop(raw_path, None)
+                self._discard_undo_for(raw_path)
         finally:
             self.file_list.blockSignals(False)
         self.drop_hint.setVisible(self.file_list.count() == 0)
@@ -631,6 +728,7 @@ class MainWindow(QMainWindow):
                 raw_path = item.data(USER_ROLE)
                 self.results.pop(raw_path, None)
                 self.recognition_outputs.pop(raw_path, None)
+                self._discard_undo_for(raw_path)
             self.file_list.clear()
         finally:
             self.file_list.blockSignals(False)
@@ -676,9 +774,16 @@ class MainWindow(QMainWindow):
         self.status.setText("사진 선택을 해제했습니다.")
 
     def selection_checks_changed(self, _item: QListWidgetItem) -> None:
+        self._style_list_item(_item)
         if self._updating_selection:
             return
         self.update_selection_controls()
+
+    def _discard_undo_for(self, raw_path: str) -> None:
+        self.recognition_undo_stack = [
+            entry for entry in self.recognition_undo_stack if entry[0] != raw_path
+        ]
+        self._update_undo_controls()
 
     def update_selection_controls(self) -> None:
         total = self.file_list.count()
@@ -762,12 +867,14 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.pending_processing.extend(paths)
             return
+        self.set_preview_mode("result")
         for path in paths:
             self.recognition_outputs.pop(str(path), None)
+            self._discard_undo_for(str(path))
             for index in range(self.file_list.count()):
                 item = self.file_list.item(index)
                 if item.data(USER_ROLE) == str(path):
-                    item.setText(f"처리 중   ·   {path.name}")
+                    self._set_list_item_label(item, f"처리 중   ·   {path.name}")
                     break
         output_dir = Path(self.output_edit.text()).expanduser()
         self.set_busy(True)
@@ -789,20 +896,28 @@ class MainWindow(QMainWindow):
 
     def processing_done(self, raw_path: str, result: CropResult) -> None:
         self.results[raw_path] = result
+        completed_item = None
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
             if item.data(USER_ROLE) == raw_path:
-                item.setText(f"{self._status_text(result.status)}   ·   {Path(raw_path).name}")
+                completed_item = item
+                self._set_list_item_label(
+                    item, f"{self._status_text(result.status)}   ·   {Path(raw_path).name}",
+                )
                 break
-        current = self.selected_path()
-        if current and str(current) == raw_path:
-            self.display_path(current)
-            message = result.message
-            if result.quality_warning:
-                message += " " + result.quality_warning
-            if result.debug_dir:
-                message += f" 단계별 캡처 저장: {result.debug_dir}"
-            self.status.setText(message)
+        # Follow the worker's completion order so the preview always shows the
+        # result that just finished, even during a multi-photo batch.
+        self.set_preview_mode("result")
+        if completed_item and self.file_list.currentItem() is not completed_item:
+            self.file_list.setCurrentItem(completed_item)
+        else:
+            self.display_path(Path(raw_path))
+        message = f"{Path(raw_path).name} · {result.message}"
+        if result.quality_warning:
+            message += " " + result.quality_warning
+        if result.debug_dir:
+            message += f" 단계별 캡처 저장: {result.debug_dir}"
+        self.status.setText(message)
         self.update_selection_controls()
 
     @staticmethod
@@ -842,7 +957,12 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _recognition_output_path(input_path: Path, output_dir: Path) -> Path:
-        return output_dir / f"{input_path.stem}_인식보정.jpg"
+        candidate = output_dir / f"{input_path.stem}_인식보정.jpg"
+        version = 2
+        while candidate.exists():
+            candidate = output_dir / f"{input_path.stem}_인식보정_{version}.jpg"
+            version += 1
+        return candidate
 
     def enhance_selected_for_recognition(self) -> None:
         source_path = self.selected_path()
@@ -862,11 +982,15 @@ class MainWindow(QMainWindow):
             _, details = enhance_for_recognition(
                 enhancement_input, enhanced_path,
             )
-            self.recognition_outputs[str(source_path)] = enhanced_path
-            details_path = output_dir / f"{source_path.stem}_인식보정.json"
+            details_path = enhanced_path.with_suffix(".json")
             details_path.write_text(
                 json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8",
             )
+            raw_path = str(source_path)
+            previous_output = self.recognition_outputs.get(raw_path)
+            self.recognition_undo_stack.append((raw_path, previous_output))
+            self.recognition_outputs[raw_path] = enhanced_path
+            self._update_undo_controls()
             self.display_path(source_path)
             before_metrics = details["metrics_before"]
             after_metrics = details["metrics_after"]
@@ -898,6 +1022,31 @@ class MainWindow(QMainWindow):
             )
         except (OSError, ValueError, cv2.error) as exc:
             QMessageBox.critical(self, "인식 보정 실패", f"이미지를 추가 보정하지 못했습니다.\n{exc}")
+
+    def undo_last_recognition_enhancement(self) -> None:
+        if not self.recognition_undo_stack:
+            return
+        raw_path, previous_output = self.recognition_undo_stack.pop()
+        if previous_output and previous_output.is_file():
+            self.recognition_outputs[raw_path] = previous_output
+        else:
+            self.recognition_outputs.pop(raw_path, None)
+        source_path = Path(raw_path)
+        for index in range(self.file_list.count()):
+            if self.file_list.item(index).data(USER_ROLE) == raw_path:
+                self.file_list.setCurrentRow(index)
+                break
+        self.display_path(source_path)
+        self.set_preview_mode("result")
+        restored = previous_output.name if previous_output and previous_output.is_file() else "이전 크롭 결과/원본"
+        self.status.setText(f"마지막 인식 보정을 되돌렸습니다. 현재 사용 결과: {restored}")
+        self._update_undo_controls()
+
+    def _update_undo_controls(self, *_args) -> None:
+        can_undo = bool(self.recognition_undo_stack) and not self.is_busy
+        self.undo_button.setEnabled(can_undo)
+        focused = QApplication.focusWidget()
+        self.undo_shortcut.setEnabled(can_undo and not isinstance(focused, QLineEdit))
 
     def open_diagnostics(self) -> None:
         path = self.selected_path()
@@ -1468,7 +1617,8 @@ class MainWindow(QMainWindow):
                        self.process_selected_button, self.process_all_button,
                        self.clear_selection_button,
                        self.print_button, self.print_all_button, self.edit_selected_button,
-                       self.recognition_enhance_button, self.open_print_logs_button,
+                       self.recognition_enhance_button, self.undo_button,
+                       self.open_print_logs_button,
                        self.output_browse_button):
             button.setEnabled(not busy)
         self.output_edit.setEnabled(not busy)
