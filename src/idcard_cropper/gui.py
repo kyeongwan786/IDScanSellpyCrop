@@ -1313,14 +1313,19 @@ class MainWindow(QMainWindow):
         form.addRow("인쇄 매수", QLabel(f"{len(print_items)}장 · 사진마다 한 장씩"))
         form.addRow("용지", QLabel("C 카드 (54 × 86 mm)"))
         form.addRow("방향", QLabel("가로"))
-        form.addRow("인쇄 영역", QLabel("C 용지 전체 채움 (86 × 54 mm)"))
+        form.addRow(
+            "인쇄 영역",
+            QLabel("사진 81 × 52 mm 가운데 배치 · 좌우 2.5 mm / 위아래 1 mm 여백"),
+        )
         self._record_print_event(
             "print_dialog_opened",
             candidate_printer=preferred_name,
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            full_page_fill=True,
+            full_page_fill=False,
+            photo_size_mm=[81.0, 52.0],
+            margins_mm=[2.5, 1.0],
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1350,9 +1355,9 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Fill the complete 86 x 54 mm C-size sheet. The saved JPG is 81 x 52 mm;
-        # it is scaled to the paper edges here so the print has no app-added
-        # white border. The selected media/orientation are reapplied each job.
+        # Place the 81 x 52 mm output at its real size, centered on the 86 x
+        # 54 mm C-size sheet, leaving 2.5 mm side and 1 mm top/bottom margins.
+        # The selected media/orientation are reapplied for every print job.
         printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
@@ -1423,13 +1428,15 @@ class MainWindow(QMainWindow):
             )
             loaded_items.append((source_path, item_result, print_path))
 
+        target_width = paper.width() * 81.0 / paper_mm.width()
+        target_height = paper.height() * 52.0 / paper_mm.height()
+        target = QRectF(0, 0, target_width, target_height)
+        target.moveCenter(QRectF(paper).center())
         if self._active_print_attempt:
             self._active_print_attempt["data"]["expected_page_count"] = len(loaded_items)
             self._active_print_attempt["data"]["target_rect_device_px"] = [
-                paper.x(), paper.y(), paper.width(), paper.height(),
+                target.x(), target.y(), target.width(), target.height(),
             ]
-
-        target = QRectF(paper)
         painter = QPainter()
         if not painter.begin(printer):
             state = printer.printerState()
