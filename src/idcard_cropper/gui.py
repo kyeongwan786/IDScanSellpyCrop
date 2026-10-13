@@ -36,7 +36,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStyle,
+    QStyleOptionButton,
     QStyleOptionViewItem,
+    QStyledItemDelegate,
     QSizePolicy,
     QStackedWidget,
     QSplitter,
@@ -184,6 +186,89 @@ class CheckablePhotoList(QListWidget):
                 else Qt.CheckState.Checked
             )
             toggle_item.setCheckState(next_state)
+
+
+class ClearCheckBox(QCheckBox):
+    """Draw a high-contrast checkbox consistently across desktop platforms."""
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        super().paintEvent(event)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self,
+        )
+        side = max(18, min(rect.width(), rect.height()))
+        rect.setSize(QSize(side, side))
+        rect.moveCenter(self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self,
+        ).center())
+        _paint_check_mark(self, rect, self.checkState())
+
+
+class ClearCheckDelegate(QStyledItemDelegate):
+    """Replace platform-dependent list check marks with a clear custom mark."""
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+        if not index.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+            return
+        item_option = QStyleOptionViewItem(option)
+        item_option.features |= QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        item_option.checkState = index.data(Qt.ItemDataRole.CheckStateRole)
+        rect = option.widget.style().subElementRect(
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator, item_option, option.widget,
+        )
+        side = max(18, min(rect.width(), rect.height()))
+        rect.setSize(QSize(side, side))
+        rect.moveCenter(option.widget.style().subElementRect(
+            QStyle.SubElement.SE_ItemViewItemCheckIndicator, item_option, option.widget,
+        ).center())
+        _paint_check_mark(painter, rect, index.data(Qt.ItemDataRole.CheckStateRole))
+
+
+def _paint_check_mark(painter_or_widget, rect, check_state) -> None:
+    painter = QPainter(painter_or_widget) if isinstance(painter_or_widget, QWidget) else painter_or_widget
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    checked = check_state == Qt.CheckState.Checked
+    partial = check_state == Qt.CheckState.PartiallyChecked
+    if checked:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#078b88"))
+        painter.drawRoundedRect(rect, 4, 4)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        pen = painter.pen()
+        pen.setStyle(Qt.PenStyle.SolidLine)
+        pen.setColor(QColor("#ffffff"))
+        pen.setWidthF(2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(
+            QPoint(round(rect.left() + rect.width() * 0.23), round(rect.top() + rect.height() * 0.53)),
+            QPoint(round(rect.left() + rect.width() * 0.43), round(rect.top() + rect.height() * 0.72)),
+        )
+        painter.drawLine(
+            QPoint(round(rect.left() + rect.width() * 0.43), round(rect.top() + rect.height() * 0.72)),
+            QPoint(round(rect.left() + rect.width() * 0.78), round(rect.top() + rect.height() * 0.30)),
+        )
+    else:
+        painter.setPen(QColor("#78869b") if not partial else QColor("#078b88"))
+        painter.setBrush(QColor("#ffffff") if not partial else QColor("#e2f3f0"))
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 4, 4)
+        if partial:
+            pen = painter.pen()
+            pen.setWidthF(2.2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(
+                QPoint(round(rect.left() + rect.width() * 0.25), rect.center().y()),
+                QPoint(round(rect.left() + rect.width() * 0.75), rect.center().y()),
+            )
+    painter.restore()
+    if isinstance(painter_or_widget, QWidget):
+        painter.end()
 
 
 class Preview(QLabel):
@@ -374,11 +459,12 @@ class MainWindow(QMainWindow):
         list_header.addWidget(self.add_folder_button)
         list_layout.addLayout(list_header)
 
-        self.select_all_checkbox = QCheckBox("모두 선택")
+        self.select_all_checkbox = ClearCheckBox("모두 선택")
         self.select_all_checkbox.setTristate(True)
         list_layout.addWidget(self.select_all_checkbox)
         self.file_list = CheckablePhotoList()
         self.file_list.setObjectName("photoList")
+        self.file_list.setItemDelegate(ClearCheckDelegate(self.file_list))
         self.file_list.setMinimumWidth(320)
         self.file_list.setIconSize(QSize(52, 52))
         self.file_list.setSpacing(6)
