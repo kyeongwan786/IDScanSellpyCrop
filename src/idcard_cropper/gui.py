@@ -1377,10 +1377,12 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Read the actual C-size paper and driver's printable area. The whole
-        # crop image is fit inside both; it is never enlarged to bleed off-page.
+        # Keep QPrinter in printable-area mode so pageRect() reports the area
+        # the selected driver can actually mark. Full-page mode makes pageRect
+        # equal paperRect and can let the image extend into an unprintable edge.
+        # The whole crop is fitted inside the driver's area; it is never clipped.
         # The selected media/orientation are reapplied for every print job.
-        printer.setFullPage(True)
+        printer.setFullPage(False)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
