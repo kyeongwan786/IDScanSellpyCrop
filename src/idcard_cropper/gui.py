@@ -400,7 +400,15 @@ class ProcessWorker(QThread):
 
     def run(self) -> None:
         for path in self.paths:
-            result = process_image(path, self.output_dir)
+            try:
+                result = process_image(path, self.output_dir)
+            except Exception as exc:
+                # A bad path or unexpected pipeline exception must not terminate
+                # the QThread before the UI receives a completion for this item.
+                result = CropResult(
+                    "failed",
+                    f"이미지 처리 중 예외가 발생했습니다: {type(exc).__name__}: {exc}",
+                )
             self.item_done.emit(str(path), result)
 
 

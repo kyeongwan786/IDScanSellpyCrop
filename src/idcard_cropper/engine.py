@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import traceback
 
 import cv2
 import numpy as np
@@ -68,7 +69,6 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     """Run id_card_crop's full detector, edge refinement, flattening and crop."""
     source = Path(input_path)
     destination = Path(output_dir).expanduser()
-    destination.mkdir(parents=True, exist_ok=True)
     debug_dir = destination / f"{source.stem}_debug"
     output_path = destination / f"{source.stem}_8.1x5.1cm.jpg"
     diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
@@ -82,6 +82,7 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     }
 
     try:
+        destination.mkdir(parents=True, exist_ok=True)
         image = _load_image(source)
         result = card_algorithm.process_image_data(
             image, source_path=source, dpi=PRINT_DPI,
@@ -137,12 +138,18 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
         return CropResult("complete", info["message"], output_path,
                           diagnostic_path, float(result["confidence"]),
                           int(result["rotation"]), warning, debug_dir=debug_dir)
-    except (OSError, ValueError, cv2.error) as exc:
-        info.update(status="failed", message=str(exc))
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        (debug_dir / "run.json").write_text(
-            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
+    except Exception as exc:
+        error_details = traceback.format_exc()
+        info.update(status="failed", message=f"{type(exc).__name__}: {exc}",
+                    error_traceback=error_details)
+        try:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            (debug_dir / "run.json").write_text(
+                json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        except OSError:
+            # Keep the worker alive even when the selected output path is not writable.
+            pass
         return CropResult("failed", f"이미지 처리 실패: {exc}",
                           debug_dir=debug_dir)
 
