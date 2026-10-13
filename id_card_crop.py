@@ -1321,7 +1321,9 @@ def _estimate_global_skew_angle(img):
 
     segments = []
     max_length = 0.45 * max(sh, sw)
-    for x1, y1, x2, y2 in lines[:, 0]:
+    # OpenCV builds differ here: HoughLinesP may return (N, 1, 4) or (N, 4).
+    # Flatten both forms to a stable list of x1, y1, x2, y2 segments.
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
         dx, dy = float(x2 - x1), float(y2 - y1)
         length = float(np.hypot(dx, dy))
         if length < min_length or length > max_length:
