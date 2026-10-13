@@ -13,7 +13,7 @@ from PIL import Image, ImageOps
 
 import id_card_crop as card_algorithm
 
-PRINT_SIZE = (957, 602)  # 8.1 x 5.1 cm at 300 DPI
+PRINT_SIZE = (957, 614)  # 8.1 x 5.2 cm at 300 DPI
 RECOGNITION_DPI = 300
 SUPPORTED_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
@@ -68,12 +68,12 @@ def process_image(input_path: str | Path, output_dir: str | Path) -> CropResult:
     destination = Path(output_dir).expanduser()
     destination.mkdir(parents=True, exist_ok=True)
     debug_dir = destination / f"{source.stem}_debug"
-    output_path = destination / f"{source.stem}_8.1x5.1cm.jpg"
+    output_path = destination / f"{source.stem}_8.1x5.2cm.jpg"
     diagnostic_path = destination / f"{source.stem}_diagnostic.jpg"
     info = {
         "source": str(source),
         "algorithm": "id_card_crop.process_image_data",
-        "target_cm": [8.1, 5.1],
+        "target_cm": [8.1, 5.2],
         "dpi": 300,
         "shrink_fraction": 0.03,
     }
