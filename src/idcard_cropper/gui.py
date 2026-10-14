@@ -11,13 +11,13 @@ import sys
 from uuid import uuid4
 
 import cv2
-from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSizeF, QSettings, QEvent,
+from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSizeF, QMarginsF, QSettings, QEvent,
                             QTimer,
                             QPoint, QMimeData)
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
                            QPalette,
                            QKeySequence, QPixmap, QShortcut,
-                           QPageLayout, QPageSize, QPainter)
+                           QPageLayout, QPageSize, QPainter, QPdfWriter)
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication,
@@ -1238,6 +1238,56 @@ class MainWindow(QMainWindow):
         self._active_print_attempt = None
         return path
 
+    @staticmethod
+    def _export_virtual_print_pdf(
+        path: Path,
+        items: list[tuple[Path, CropResult | None, Path]],
+        photo_size_mm: list[float],
+        margins_mm: list[float],
+        dpi: int,
+    ) -> None:
+        """Render the exact printer target onto virtual 86 x 54 mm PDF pages."""
+        writer = QPdfWriter(str(path))
+        writer.setResolution(max(72, dpi))
+        page_size = QPageSize(
+            QSizeF(54.0, 86.0), QPageSize.Unit.Millimeter, "SELPHY C 86 x 54 mm",
+        )
+        layout = QPageLayout(
+            page_size,
+            QPageLayout.Orientation.Landscape,
+            QMarginsF(0.0, 0.0, 0.0, 0.0),
+            QPageLayout.Unit.Millimeter,
+            QMarginsF(0.0, 0.0, 0.0, 0.0),
+        )
+        if not writer.setPageLayout(layout):
+            raise OSError("가상 PDF에 86 × 54mm 페이지 크기를 설정하지 못했습니다.")
+
+        page = writer.pageLayout().fullRectPixels(writer.resolution())
+        px_per_mm_x = page.width() / 86.0
+        px_per_mm_y = page.height() / 54.0
+        target = QRectF(
+            page.x() + margins_mm[0] * px_per_mm_x,
+            page.y() + margins_mm[1] * px_per_mm_y,
+            photo_size_mm[0] * px_per_mm_x,
+            photo_size_mm[1] * px_per_mm_y,
+        )
+
+        painter = QPainter()
+        if not painter.begin(writer):
+            raise OSError("가상 PDF 파일을 만들지 못했습니다.")
+        try:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            for index, (_, _, image_path) in enumerate(items):
+                image = QImage(str(image_path))
+                if image.isNull():
+                    raise OSError(f"PDF 검사 이미지를 열 수 없습니다: {image_path}")
+                if index and not writer.newPage():
+                    raise OSError(f"PDF 검사 {index + 1}페이지를 만들지 못했습니다.")
+                painter.drawImage(target, image)
+        finally:
+            if not painter.end():
+                raise OSError("가상 PDF 저장을 완료하지 못했습니다.")
+
     def print_selected(
         self, paths: list[Path] | None = None, scope_label: str = "선택한",
     ) -> None:
@@ -1341,7 +1391,18 @@ class MainWindow(QMainWindow):
         )
         form.addRow(preferences_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, parent=dialog)
-        buttons.addButton("인쇄", QDialogButtonBox.ButtonRole.AcceptRole)
+        requested_action = {"value": "print"}
+        pdf_button = buttons.addButton(
+            "가상 PDF 검사", QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        pdf_button.setToolTip(
+            "종이를 쓰지 않고 Canon 프린터 기준 배치를 86 × 54mm PDF로 저장합니다."
+        )
+        pdf_button.clicked.connect(
+            lambda: (requested_action.update(value="pdf"), dialog.accept())
+        )
+        print_button = buttons.addButton("인쇄", QDialogButtonBox.ButtonRole.AcceptRole)
+        print_button.clicked.connect(lambda: requested_action.update(value="print"))
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
@@ -1350,6 +1411,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self._finish_print_attempt("cancelled_in_print_dialog")
             return
+        virtual_pdf = requested_action["value"] == "pdf"
 
         selected_printer = printer_combo.currentText()
         layout_name = "fit_complete_crop_inside_printable_area"
@@ -1495,6 +1557,76 @@ class MainWindow(QMainWindow):
             self._active_print_attempt["data"]["target_rect_device_px"] = [
                 target.x(), target.y(), target.width(), target.height(),
             ]
+
+        if virtual_pdf:
+            attempt_id = (
+                self._active_print_attempt["data"]["attempt_id"]
+                if self._active_print_attempt else "print_proof"
+            )
+            default_pdf = loaded_items[0][2].parent / f"{attempt_id}_virtual-proof.pdf"
+            pdf_path, _ = QFileDialog.getSaveFileName(
+                self, "가상 인쇄 PDF 저장", str(default_pdf), "PDF 파일 (*.pdf)",
+            )
+            if not pdf_path:
+                self._finish_print_attempt("virtual_pdf_cancelled")
+                return
+            pdf_path = Path(pdf_path)
+            if pdf_path.suffix.lower() != ".pdf":
+                pdf_path = pdf_path.with_suffix(".pdf")
+            try:
+                self._export_virtual_print_pdf(
+                    pdf_path, loaded_items, photo_size_mm, margins_mm,
+                    printer.resolution(),
+                )
+            except Exception as exc:
+                self._record_print_event(
+                    "virtual_pdf_failed", error=f"{type(exc).__name__}: {exc}",
+                )
+                self._finish_print_attempt(
+                    "virtual_pdf_failed", pdf_path=str(pdf_path),
+                    error=f"{type(exc).__name__}: {exc}",
+                    physical_print_confirmed=False,
+                )
+                QMessageBox.critical(
+                    self, "가상 PDF 생성 실패",
+                    f"PDF 검사 파일을 저장하지 못했습니다.\n{exc}",
+                )
+                return
+
+            if self._active_print_attempt:
+                self._active_print_attempt["data"]["pages"] = [
+                    {
+                        "page_number": index + 1,
+                        "source_path": str(source_path.resolve()),
+                        "image_path": str(image_path),
+                        "new_page_called": index > 0,
+                        "draw_called": True,
+                        "virtual_pdf": True,
+                    }
+                    for index, (source_path, _, image_path) in enumerate(loaded_items)
+                ]
+            self._record_print_event(
+                "virtual_pdf_saved",
+                pdf_path=str(pdf_path),
+                page_size_mm=[86.0, 54.0],
+                photo_size_mm=photo_size_mm,
+                margins_mm=margins_mm,
+            )
+            self._finish_print_attempt(
+                "virtual_pdf_saved", pdf_path=str(pdf_path),
+                expected_page_count=len(loaded_items),
+                rendered_page_count=len(loaded_items),
+                physical_print_confirmed=False,
+            )
+            QMessageBox.information(
+                self, "가상 PDF 저장 완료",
+                "종이를 사용하지 않고 가상 인쇄 PDF를 저장했습니다.\n\n"
+                f"{pdf_path}\n\n"
+                "PDF 안에 오른쪽 흰 선이 있으면 앱의 이미지 배치 쪽을, "
+                "없으면 Canon 드라이버로 보내는 과정의 차이를 더 확인하면 됩니다.",
+            )
+            return
+
         painter = QPainter()
         if not painter.begin(printer):
             state = printer.printerState()
