@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import platform
 from datetime import datetime
 from pathlib import Path
 import subprocess
@@ -13,7 +15,7 @@ from uuid import uuid4
 import cv2
 from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSizeF, QMarginsF, QSettings, QEvent,
                             QTimer,
-                            QPoint, QMimeData)
+                            QPoint, QMimeData, qVersion)
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
                            QPalette,
                            QKeySequence, QPixmap, QShortcut,
@@ -1168,6 +1170,71 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.debug_dir.resolve())))
 
+    @staticmethod
+    def _runtime_print_diagnostics() -> dict:
+        module_path = Path(__file__).resolve()
+        executable_path = Path(sys.executable).resolve()
+
+        def file_info(path: Path) -> dict:
+            try:
+                stat = path.stat()
+                info = {
+                    "path": str(path),
+                    "exists": True,
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+                if path.suffix.lower() == ".py" and stat.st_size <= 2_000_000:
+                    info["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                return info
+            except OSError as exc:
+                return {"path": str(path), "exists": False,
+                        "error": f"{type(exc).__name__}: {exc}"}
+
+        repo_root = module_path.parents[2]
+        git_commit = None
+        if (repo_root / ".git").exists():
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo_root,
+                    capture_output=True, text=True, timeout=2, check=False,
+                )
+                if result.returncode == 0:
+                    git_commit = result.stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+            try:
+                package_version = version("id-card-scan-cropper")
+            except PackageNotFoundError:
+                package_version = None
+        except ImportError:
+            package_version = None
+        app_info = {
+            "package_version": package_version,
+            "git_commit": git_commit,
+            "frozen_executable": bool(getattr(sys, "frozen", False)),
+            "argv0": sys.argv[0] if sys.argv else None,
+            "executable": file_info(executable_path),
+            "gui_module": file_info(module_path),
+            "pyinstaller_extract_dir": getattr(sys, "_MEIPASS", None),
+        }
+        return {
+            "application": app_info,
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "version": platform.version(),
+                "machine": platform.machine(),
+                "platform_string": platform.platform(),
+                "python": sys.version,
+                "qt": qVersion(),
+            },
+        }
+
     def _start_print_attempt(self, scope_label: str, paths: list[Path]) -> Path | None:
         self.last_print_log_error = None
         output_dir = Path(self.output_edit.text()).expanduser()
@@ -1178,9 +1245,10 @@ class MainWindow(QMainWindow):
             "path": log_path,
             "write_error": None,
             "data": {
-                "log_version": 1,
+                "log_version": 2,
                 "attempt_id": log_path.stem,
                 "started_at": timestamp,
+                **self._runtime_print_diagnostics(),
                 "scope": scope_label,
                 "requested_count": len(paths),
                 "requested_files": [
@@ -1220,6 +1288,163 @@ class MainWindow(QMainWindow):
             **details,
         })
         self._save_print_attempt_log()
+
+    @staticmethod
+    def _rect_diagnostics(rect: QRectF | QRect) -> dict[str, float]:
+        return {
+            "x": float(rect.x()),
+            "y": float(rect.y()),
+            "width": float(rect.width()),
+            "height": float(rect.height()),
+            "left": float(rect.left()),
+            "top": float(rect.top()),
+            "right": float(rect.right()),
+            "bottom": float(rect.bottom()),
+        }
+
+    @staticmethod
+    def _print_image_diagnostics(image: QImage, path: Path) -> dict:
+        """Capture image identity and edge pixels before handing it to a driver."""
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest_error = None
+        except OSError as exc:
+            digest = None
+            digest_error = f"{type(exc).__name__}: {exc}"
+
+        width = image.width()
+        height = image.height()
+        sample_x = sorted({0, 1, 2, 3, 4, 8, 16, width // 4, width // 2,
+                           (width * 3) // 4, max(0, width - 17),
+                           max(0, width - 9), max(0, width - 5),
+                           max(0, width - 4), max(0, width - 3),
+                           max(0, width - 2), max(0, width - 1)})
+        sample_y = sorted({0, 1, 2, 3, 4, 8, 16, height // 4, height // 2,
+                           (height * 3) // 4, max(0, height - 17),
+                           max(0, height - 9), max(0, height - 5),
+                           max(0, height - 4), max(0, height - 3),
+                           max(0, height - 2), max(0, height - 1)})
+        edge_samples = {}
+        for edge, y in (("top", 0), ("bottom", max(0, height - 1))):
+            edge_samples[edge] = [
+                {
+                    "x": x,
+                    "rgba": image.pixelColor(x, y).getRgb(),
+                }
+                for x in sample_x
+            ]
+        for edge, x in (("left", 0), ("right", max(0, width - 1))):
+            edge_samples[edge] = [
+                {
+                    "y": y,
+                    "rgba": image.pixelColor(x, y).getRgb(),
+                }
+                for y in sample_y
+            ]
+
+        # Summarize narrow edge bands, where a one- or two-pixel white seam
+        # can hide between the point samples above. Cap long-edge sampling to
+        # roughly 512 positions so larger scans do not stall printing.
+        band_stats = {}
+        for side in ("left", "right", "top", "bottom"):
+            horizontal_edge = side in ("top", "bottom")
+            span = width if horizontal_edge else height
+            stride = max(1, span // 512)
+            side_stats = {"sample_stride_px": stride, "bands": {}}
+            for band_width in (1, 2, 4, 8, 16):
+                band = min(band_width, height if horizontal_edge else width)
+                channels = [0, 0, 0, 0]
+                minimum = [255, 255, 255, 255]
+                maximum = [0, 0, 0, 0]
+                white_count = 0
+                translucent_count = 0
+                count = 0
+                for position in range(0, span, stride):
+                    for depth in range(band):
+                        if side == "left":
+                            x, y = depth, position
+                        elif side == "right":
+                            x, y = width - band + depth, position
+                        elif side == "top":
+                            x, y = position, depth
+                        else:
+                            x, y = position, height - band + depth
+                        rgba = image.pixelColor(x, y).getRgb()
+                        for channel in range(4):
+                            channels[channel] += rgba[channel]
+                            minimum[channel] = min(minimum[channel], rgba[channel])
+                            maximum[channel] = max(maximum[channel], rgba[channel])
+                        white_count += all(value >= 250 for value in rgba[:3])
+                        translucent_count += rgba[3] < 255
+                        count += 1
+                side_stats["bands"][str(band_width)] = {
+                    "sampled_pixels": count,
+                    "mean_rgba": [round(value / count, 3) for value in channels],
+                    "min_rgba": minimum,
+                    "max_rgba": maximum,
+                    "near_white_fraction": round(white_count / count, 6),
+                    "non_opaque_fraction": round(translucent_count / count, 6),
+                }
+            band_stats[side] = side_stats
+
+        return {
+            "path": str(path.resolve()),
+            "sha256": digest,
+            "sha256_error": digest_error,
+            "size_px": [width, height],
+            "format": image.format().name,
+            "bytes_per_line": image.bytesPerLine(),
+            "device_pixel_ratio": image.devicePixelRatio(),
+            "dots_per_meter": [image.dotsPerMeterX(), image.dotsPerMeterY()],
+            "has_alpha_channel": image.hasAlphaChannel(),
+            "color_space_valid": image.colorSpace().isValid(),
+            "color_space_description": image.colorSpace().description(),
+            "edge_samples_rgba": edge_samples,
+            "edge_band_statistics": band_stats,
+        }
+
+    @classmethod
+    def _write_print_geometry_preview(
+        cls,
+        path: Path,
+        image: QImage,
+        target: QRectF,
+        paper: QRect,
+        page: QRect,
+        full_page: bool,
+    ) -> dict:
+        """Save the app-side raster as placed for printing, before driver handling."""
+        preview = QImage(
+            max(1, paper.width()), max(1, paper.height()),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        preview.fill(Qt.GlobalColor.white)
+        painter = QPainter(preview)
+        if not painter.isActive():
+            raise RuntimeError("Could not start diagnostic preview painter")
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if not full_page:
+            painter.translate(page.x(), page.y())
+            painter.setClipRect(
+                QRectF(0, 0, page.width(), page.height()),
+                Qt.ClipOperation.ReplaceClip,
+            )
+        painter.drawImage(target, image)
+        painter.end()
+        if not preview.save(str(path), "PNG"):
+            raise OSError(f"Could not save diagnostic preview: {path}")
+        preview_diagnostics = cls._print_image_diagnostics(preview, path)
+        return {
+            "path": str(path.resolve()),
+            "sha256": preview_diagnostics["sha256"],
+            "stage": "Qt-side raster after app placement/clipping, before OS printer driver",
+            "size_px": [preview.width(), preview.height()],
+            "paper_rect_device_px": [paper.x(), paper.y(), paper.width(), paper.height()],
+            "page_rect_device_px": [page.x(), page.y(), page.width(), page.height()],
+            "full_page": full_page,
+            "edge_samples_rgba": preview_diagnostics["edge_samples_rgba"],
+            "edge_band_statistics": preview_diagnostics["edge_band_statistics"],
+        }
 
     def _finish_print_attempt(self, status: str, **details) -> Path | None:
         attempt = self._active_print_attempt
@@ -1448,18 +1673,58 @@ class MainWindow(QMainWindow):
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
+        paper_pt = printer.paperRect(QPrinter.Unit.Point)
+        page_mm = printer.pageRect(QPrinter.Unit.Millimeter)
         printable = QRectF(page).intersected(QRectF(paper))
         is_c_landscape = (
             abs(paper_mm.width() - 86.0) <= 0.5
             and abs(paper_mm.height() - 54.0) <= 0.5
         )
+        printer_info = QPrinterInfo(printer)
+        page_layout = printer.pageLayout()
+        driver_margins_mm = page_layout.margins(QPageLayout.Unit.Millimeter)
+        supported_sizes = []
+        for supported_size in printer_info.supportedPageSizes():
+            size_mm = supported_size.size(QPageSize.Unit.Millimeter)
+            supported_sizes.append({
+                "name": supported_size.name(),
+                "width_mm": size_mm.width(),
+                "height_mm": size_mm.height(),
+            })
         printer_geometry = {
             "printer_name": selected_printer,
+            "printer_description": printer_info.description(),
+            "printer_make_and_model": printer_info.makeAndModel(),
+            "printer_is_default": printer_info.isDefault(),
             "printer_state_before_job": printer.printerState().name,
+            "printer_mode": printer.printerMode().name,
+            "full_page": printer.fullPage(),
             "resolution_dpi": printer.resolution(),
+            "logical_dpi": [printer.logicalDpiX(), printer.logicalDpiY()],
+            "physical_dpi": [printer.physicalDpiX(), printer.physicalDpiY()],
             "paper_rect_mm": [paper_mm.x(), paper_mm.y(), paper_mm.width(), paper_mm.height()],
             "paper_rect_device_px": [paper.x(), paper.y(), paper.width(), paper.height()],
             "page_rect_device_px": [page.x(), page.y(), page.width(), page.height()],
+            "paper_rect_points": [paper_pt.x(), paper_pt.y(), paper_pt.width(), paper_pt.height()],
+            "page_rect_mm": [page_mm.x(), page_mm.y(), page_mm.width(), page_mm.height()],
+            "printable_rect_device_px": self._rect_diagnostics(printable),
+            "page_layout": {
+                "orientation": page_layout.orientation().name,
+                "mode": page_layout.mode().name,
+                "page_size_name": page_layout.pageSize().name(),
+                "margins_mm": {
+                    "left": driver_margins_mm.left(),
+                    "top": driver_margins_mm.top(),
+                    "right": driver_margins_mm.right(),
+                    "bottom": driver_margins_mm.bottom(),
+                },
+            },
+            "driver_supported_page_sizes": supported_sizes,
+            "runtime": {
+                "platform": sys.platform,
+                "python": sys.version,
+                "qt_version": qVersion(),
+            },
             "orientation_expected": "Landscape",
             "c_landscape_detected": is_c_landscape,
         }
@@ -1530,6 +1795,10 @@ class MainWindow(QMainWindow):
         target_x = min(max(target_x, printable.left()), printable.right() - target_width)
         target_y = min(max(target_y, printable.top()), printable.bottom() - target_height)
         target = QRectF(target_x, target_y, target_width, target_height)
+        # QPrinter with fullPage=False uses pageRect's top-left as the painter
+        # origin. Keep both coordinate interpretations in the diagnostic log.
+        target_painter_origin = target.translated(-page.x(), -page.y())
+        target_if_paper_coordinates_are_passed = target.translated(page.x(), page.y())
         paper_scale_x = paper_mm.width() / paper.width()
         paper_scale_y = paper_mm.height() / paper.height()
         photo_size_mm = [target_width * paper_scale_x, target_height * paper_scale_y]
@@ -1546,6 +1815,15 @@ class MainWindow(QMainWindow):
         self._record_print_event(
             "print_target_fitted",
             target_rect_device_px=[target.x(), target.y(), target.width(), target.height()],
+            target_rect_paper_coordinates=self._rect_diagnostics(target),
+            target_rect_if_painter_origin_is_printable_area=self._rect_diagnostics(
+                target_if_paper_coordinates_are_passed
+            ),
+            target_rect_translated_for_printable_origin=self._rect_diagnostics(
+                target_painter_origin
+            ),
+            coordinate_origin_offset_device_px=[page.x(), page.y()],
+            full_page_coordinate_origin=printer.fullPage(),
             actual_image_size_mm=photo_size_mm,
             fit_scale=fit_scale,
             printable_rect_device_px=[
@@ -1645,6 +1923,26 @@ class MainWindow(QMainWindow):
             return
         self._record_print_event("painter_started", expected_pages=len(loaded_items))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        transform = painter.deviceTransform()
+        painter_context = {
+            "coordinate_origin": "printable_area" if not printer.fullPage() else "paper",
+            "device_size_px": [painter.device().width(), painter.device().height()],
+            "device_logical_dpi": [
+                painter.device().logicalDpiX(), painter.device().logicalDpiY(),
+            ],
+            "device_physical_dpi": [
+                painter.device().physicalDpiX(), painter.device().physicalDpiY(),
+            ],
+            "viewport": self._rect_diagnostics(painter.viewport()),
+            "window": self._rect_diagnostics(painter.window()),
+            "device_transform": [
+                transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                transform.dx(), transform.dy(),
+            ],
+            "has_clip": painter.hasClipping(),
+            "clip_rect_logical": self._rect_diagnostics(painter.clipBoundingRect()),
+        }
+        self._record_print_event("painter_context", **painter_context)
         rendered_count = 0
         page_error = False
         page_failure = None
@@ -1661,6 +1959,50 @@ class MainWindow(QMainWindow):
                 page_error = True
                 page_failure = {"page_number": index + 1, "reason": "new_page_failed"}
                 break
+            transform = painter.deviceTransform()
+            mapped_target = transform.mapRect(target)
+            painter_clip = painter.clipBoundingRect()
+            logical_intersection = target.intersected(painter_clip)
+            preview_info = None
+            preview_error = None
+            try:
+                attempt_log = self._active_print_attempt["path"]
+                preview_path = attempt_log.with_name(
+                    f"{attempt_log.stem}_page_{index + 1:02d}_app-render.png"
+                )
+                preview_info = self._write_print_geometry_preview(
+                    preview_path, image, target, paper, page, printer.fullPage(),
+                )
+            except Exception as exc:
+                # Diagnostics must never prevent or alter the requested print.
+                preview_error = f"{type(exc).__name__}: {exc}"
+            bitmap_diagnostics = self._print_image_diagnostics(image, print_path)
+            draw_context = {
+                "page_number": index + 1,
+                "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
+                "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
+                "target_intersection_with_painter_clip": self._rect_diagnostics(
+                    logical_intersection
+                ),
+                "target_clipped_by_painter_px": {
+                    "left": max(0.0, logical_intersection.left() - target.left()),
+                    "top": max(0.0, logical_intersection.top() - target.top()),
+                    "right": max(0.0, target.right() - logical_intersection.right()),
+                    "bottom": max(0.0, target.bottom() - logical_intersection.bottom()),
+                },
+                "painter_has_clip": painter.hasClipping(),
+                "painter_clip_rect_logical": self._rect_diagnostics(painter_clip),
+                "page_rect_device_px": self._rect_diagnostics(page),
+                "paper_rect_device_px": self._rect_diagnostics(paper),
+                "painter_device_transform": [
+                    transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                    transform.dx(), transform.dy(),
+                ],
+                "app_side_render_preview": preview_info,
+                "app_side_render_preview_error": preview_error,
+                "bitmap": bitmap_diagnostics,
+            }
+            self._record_print_event("draw_geometry_and_bitmap", **draw_context)
             painter.drawImage(target, image)
             rendered_count += 1
             page_details = {
@@ -1668,6 +2010,11 @@ class MainWindow(QMainWindow):
                 "source_path": str(source_path.resolve()),
                 "image_path": str(print_path),
                 "image_size_px": [image.width(), image.height()],
+                "image_sha256": bitmap_diagnostics["sha256"],
+                "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
+                "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
+                "app_side_render_preview": preview_info,
+                "app_side_render_preview_error": preview_error,
                 "new_page_called": new_page_called,
                 "new_page_succeeded": new_page_succeeded,
                 "draw_called": True,
