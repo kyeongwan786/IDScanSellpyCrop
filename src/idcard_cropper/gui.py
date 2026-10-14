@@ -1241,6 +1241,12 @@ class MainWindow(QMainWindow):
         timestamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
         stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
         log_path = output_dir / "print_logs" / f"print_{stamp}_{uuid4().hex[:8]}.json"
+        try:
+            runtime_diagnostics = self._runtime_print_diagnostics()
+        except Exception as exc:
+            runtime_diagnostics = {
+                "runtime_diagnostics_error": f"{type(exc).__name__}: {exc}",
+            }
         self._active_print_attempt = {
             "path": log_path,
             "write_error": None,
@@ -1248,7 +1254,7 @@ class MainWindow(QMainWindow):
                 "log_version": 2,
                 "attempt_id": log_path.stem,
                 "started_at": timestamp,
-                **self._runtime_print_diagnostics(),
+                **runtime_diagnostics,
                 "scope": scope_label,
                 "requested_count": len(paths),
                 "requested_files": [
@@ -1673,55 +1679,23 @@ class MainWindow(QMainWindow):
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
-        paper_pt = printer.paperRect(QPrinter.Unit.Point)
-        page_mm = printer.pageRect(QPrinter.Unit.Millimeter)
         printable = QRectF(page).intersected(QRectF(paper))
         is_c_landscape = (
             abs(paper_mm.width() - 86.0) <= 0.5
             and abs(paper_mm.height() - 54.0) <= 0.5
         )
-        printer_info = QPrinterInfo(printer)
-        page_layout = printer.pageLayout()
-        driver_margins_mm = page_layout.margins(QPageLayout.Unit.Millimeter)
-        supported_sizes = []
-        for supported_size in printer_info.supportedPageSizes():
-            size_mm = supported_size.size(QPageSize.Unit.Millimeter)
-            supported_sizes.append({
-                "name": supported_size.name(),
-                "width_mm": size_mm.width(),
-                "height_mm": size_mm.height(),
-            })
         printer_geometry = {
             "printer_name": selected_printer,
-            "printer_description": printer_info.description(),
-            "printer_make_and_model": printer_info.makeAndModel(),
-            "printer_is_default": printer_info.isDefault(),
             "printer_state_before_job": printer.printerState().name,
             # QPrinter exposes the selected mode at construction, but PySide6
             # does not provide a printerMode() getter.
             "printer_mode_requested": QPrinter.PrinterMode.HighResolution.name,
             "full_page": printer.fullPage(),
             "resolution_dpi": printer.resolution(),
-            "logical_dpi": [printer.logicalDpiX(), printer.logicalDpiY()],
-            "physical_dpi": [printer.physicalDpiX(), printer.physicalDpiY()],
             "paper_rect_mm": [paper_mm.x(), paper_mm.y(), paper_mm.width(), paper_mm.height()],
             "paper_rect_device_px": [paper.x(), paper.y(), paper.width(), paper.height()],
             "page_rect_device_px": [page.x(), page.y(), page.width(), page.height()],
-            "paper_rect_points": [paper_pt.x(), paper_pt.y(), paper_pt.width(), paper_pt.height()],
-            "page_rect_mm": [page_mm.x(), page_mm.y(), page_mm.width(), page_mm.height()],
             "printable_rect_device_px": self._rect_diagnostics(printable),
-            "page_layout": {
-                "orientation": page_layout.orientation().name,
-                "mode": page_layout.mode().name,
-                "page_size_name": page_layout.pageSize().name(),
-                "margins_mm": {
-                    "left": driver_margins_mm.left(),
-                    "top": driver_margins_mm.top(),
-                    "right": driver_margins_mm.right(),
-                    "bottom": driver_margins_mm.bottom(),
-                },
-            },
-            "driver_supported_page_sizes": supported_sizes,
             "runtime": {
                 "platform": sys.platform,
                 "python": sys.version,
@@ -1730,6 +1704,47 @@ class MainWindow(QMainWindow):
             "orientation_expected": "Landscape",
             "c_landscape_detected": is_c_landscape,
         }
+        try:
+            printer_info = QPrinterInfo(printer)
+            page_layout = printer.pageLayout()
+            driver_margins_mm = page_layout.margins(QPageLayout.Unit.Millimeter)
+            supported_sizes = []
+            for supported_size in printer_info.supportedPageSizes():
+                size_mm = supported_size.size(QPageSize.Unit.Millimeter)
+                supported_sizes.append({
+                    "name": supported_size.name(),
+                    "width_mm": size_mm.width(),
+                    "height_mm": size_mm.height(),
+                })
+            paper_pt = printer.paperRect(QPrinter.Unit.Point)
+            page_mm = printer.pageRect(QPrinter.Unit.Millimeter)
+            printer_geometry.update({
+                "printer_description": printer_info.description(),
+                "printer_make_and_model": printer_info.makeAndModel(),
+                "printer_is_default": printer_info.isDefault(),
+                "logical_dpi": [printer.logicalDpiX(), printer.logicalDpiY()],
+                "physical_dpi": [printer.physicalDpiX(), printer.physicalDpiY()],
+                "paper_rect_points": [
+                    paper_pt.x(), paper_pt.y(), paper_pt.width(), paper_pt.height(),
+                ],
+                "page_rect_mm": [page_mm.x(), page_mm.y(), page_mm.width(), page_mm.height()],
+                "page_layout": {
+                    "orientation": page_layout.orientation().name,
+                    "mode": page_layout.mode().name,
+                    "page_size_name": page_layout.pageSize().name(),
+                    "margins_mm": {
+                        "left": driver_margins_mm.left(),
+                        "top": driver_margins_mm.top(),
+                        "right": driver_margins_mm.right(),
+                        "bottom": driver_margins_mm.bottom(),
+                    },
+                },
+                "driver_supported_page_sizes": supported_sizes,
+            })
+        except Exception as exc:
+            printer_geometry["extended_diagnostics_error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
         if self._active_print_attempt:
             self._active_print_attempt["data"]["printer"] = printer_geometry
         self._record_print_event("printer_geometry_read", **printer_geometry)
@@ -1925,26 +1940,32 @@ class MainWindow(QMainWindow):
             return
         self._record_print_event("painter_started", expected_pages=len(loaded_items))
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        transform = painter.deviceTransform()
-        painter_context = {
-            "coordinate_origin": "printable_area" if not printer.fullPage() else "paper",
-            "device_size_px": [painter.device().width(), painter.device().height()],
-            "device_logical_dpi": [
-                painter.device().logicalDpiX(), painter.device().logicalDpiY(),
-            ],
-            "device_physical_dpi": [
-                painter.device().physicalDpiX(), painter.device().physicalDpiY(),
-            ],
-            "viewport": self._rect_diagnostics(painter.viewport()),
-            "window": self._rect_diagnostics(painter.window()),
-            "device_transform": [
-                transform.m11(), transform.m12(), transform.m21(), transform.m22(),
-                transform.dx(), transform.dy(),
-            ],
-            "has_clip": painter.hasClipping(),
-            "clip_rect_logical": self._rect_diagnostics(painter.clipBoundingRect()),
-        }
-        self._record_print_event("painter_context", **painter_context)
+        try:
+            transform = painter.deviceTransform()
+            painter_context = {
+                "coordinate_origin": "printable_area" if not printer.fullPage() else "paper",
+                "device_size_px": [painter.device().width(), painter.device().height()],
+                "device_logical_dpi": [
+                    painter.device().logicalDpiX(), painter.device().logicalDpiY(),
+                ],
+                "device_physical_dpi": [
+                    painter.device().physicalDpiX(), painter.device().physicalDpiY(),
+                ],
+                "viewport": self._rect_diagnostics(painter.viewport()),
+                "window": self._rect_diagnostics(painter.window()),
+                "device_transform": [
+                    transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                    transform.dx(), transform.dy(),
+                ],
+                "has_clip": painter.hasClipping(),
+                "clip_rect_logical": self._rect_diagnostics(painter.clipBoundingRect()),
+            }
+            self._record_print_event("painter_context", **painter_context)
+        except Exception as exc:
+            self._record_print_event(
+                "painter_context_diagnostics_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         rendered_count = 0
         page_error = False
         page_failure = None
@@ -1961,10 +1982,35 @@ class MainWindow(QMainWindow):
                 page_error = True
                 page_failure = {"page_number": index + 1, "reason": "new_page_failed"}
                 break
-            transform = painter.deviceTransform()
-            mapped_target = transform.mapRect(target)
-            painter_clip = painter.clipBoundingRect()
-            logical_intersection = target.intersected(painter_clip)
+            geometry_diagnostics = {}
+            mapped_target = None
+            try:
+                transform = painter.deviceTransform()
+                mapped_target = transform.mapRect(target)
+                painter_clip = painter.clipBoundingRect()
+                logical_intersection = target.intersected(painter_clip)
+                geometry_diagnostics = {
+                    "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
+                    "target_intersection_with_painter_clip": self._rect_diagnostics(
+                        logical_intersection
+                    ),
+                    "target_clipped_by_painter_px": {
+                        "left": max(0.0, logical_intersection.left() - target.left()),
+                        "top": max(0.0, logical_intersection.top() - target.top()),
+                        "right": max(0.0, target.right() - logical_intersection.right()),
+                        "bottom": max(0.0, target.bottom() - logical_intersection.bottom()),
+                    },
+                    "painter_has_clip": painter.hasClipping(),
+                    "painter_clip_rect_logical": self._rect_diagnostics(painter_clip),
+                    "painter_device_transform": [
+                        transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                        transform.dx(), transform.dy(),
+                    ],
+                }
+            except Exception as exc:
+                geometry_diagnostics = {
+                    "geometry_diagnostics_error": f"{type(exc).__name__}: {exc}",
+                }
             preview_info = None
             preview_error = None
             try:
@@ -1978,31 +2024,22 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 # Diagnostics must never prevent or alter the requested print.
                 preview_error = f"{type(exc).__name__}: {exc}"
-            bitmap_diagnostics = self._print_image_diagnostics(image, print_path)
+            try:
+                bitmap_diagnostics = self._print_image_diagnostics(image, print_path)
+            except Exception as exc:
+                bitmap_diagnostics = {
+                    "path": str(print_path.resolve()),
+                    "diagnostics_error": f"{type(exc).__name__}: {exc}",
+                }
             draw_context = {
                 "page_number": index + 1,
                 "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
-                "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
-                "target_intersection_with_painter_clip": self._rect_diagnostics(
-                    logical_intersection
-                ),
-                "target_clipped_by_painter_px": {
-                    "left": max(0.0, logical_intersection.left() - target.left()),
-                    "top": max(0.0, logical_intersection.top() - target.top()),
-                    "right": max(0.0, target.right() - logical_intersection.right()),
-                    "bottom": max(0.0, target.bottom() - logical_intersection.bottom()),
-                },
-                "painter_has_clip": painter.hasClipping(),
-                "painter_clip_rect_logical": self._rect_diagnostics(painter_clip),
                 "page_rect_device_px": self._rect_diagnostics(page),
                 "paper_rect_device_px": self._rect_diagnostics(paper),
-                "painter_device_transform": [
-                    transform.m11(), transform.m12(), transform.m21(), transform.m22(),
-                    transform.dx(), transform.dy(),
-                ],
                 "app_side_render_preview": preview_info,
                 "app_side_render_preview_error": preview_error,
                 "bitmap": bitmap_diagnostics,
+                **geometry_diagnostics,
             }
             self._record_print_event("draw_geometry_and_bitmap", **draw_context)
             painter.drawImage(target, image)
@@ -2012,9 +2049,11 @@ class MainWindow(QMainWindow):
                 "source_path": str(source_path.resolve()),
                 "image_path": str(print_path),
                 "image_size_px": [image.width(), image.height()],
-                "image_sha256": bitmap_diagnostics["sha256"],
+                "image_sha256": bitmap_diagnostics.get("sha256"),
                 "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
-                "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
+                "target_rect_mapped_to_device": (
+                    self._rect_diagnostics(mapped_target) if mapped_target is not None else None
+                ),
                 "app_side_render_preview": preview_info,
                 "app_side_render_preview_error": preview_error,
                 "new_page_called": new_page_called,
