@@ -1604,7 +1604,7 @@ class MainWindow(QMainWindow):
         form.addRow("방향", QLabel("가로"))
         form.addRow(
             "인쇄 배치",
-            QLabel("크롭 이미지 전체 출력 · 최대 81 × 51 mm", dialog),
+            QLabel("용지 안에 사진 전체 맞춤 · 잘림 없음", dialog),
         )
         self._record_print_event(
             "print_dialog_opened",
@@ -1612,8 +1612,7 @@ class MainWindow(QMainWindow):
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            layout="fit_complete_crop_inside_printable_area",
-            target_size_mm=[81.0, 51.0],
+            layout="fit_complete_image_inside_full_paper",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1645,20 +1644,14 @@ class MainWindow(QMainWindow):
         virtual_pdf = requested_action["value"] == "pdf"
 
         selected_printer = printer_combo.currentText()
-        layout_name = "fit_complete_crop_inside_printable_area"
-        photo_size_mm = [81.0, 51.0]
-        margins_mm = [2.5, 1.5]
+        layout_name = "fit_complete_image_inside_full_paper"
         if self._active_print_attempt:
             self._active_print_attempt["data"].update(
                 layout=layout_name,
-                photo_size_mm=photo_size_mm,
-                margins_mm=margins_mm,
             )
         self._record_print_event(
             "print_layout_selected",
             layout=layout_name,
-            photo_size_mm=photo_size_mm,
-            margins_mm=margins_mm,
         )
         settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
         settings.setValue("printing/last_printer", selected_printer)
@@ -1670,12 +1663,10 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Keep QPrinter in printable-area mode so pageRect() reports the area
-        # the selected driver can actually mark. Full-page mode makes pageRect
-        # equal paperRect and can let the image extend into an unprintable edge.
-        # The whole crop is fitted inside the driver's area; it is never clipped.
+        # Use the selected sheet as the layout area. The image is fit inside it
+        # with its aspect ratio preserved, so no part of the crop is discarded.
         # The selected media/orientation are reapplied for every print job.
-        printer.setFullPage(False)
+        printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
@@ -1798,24 +1789,32 @@ class MainWindow(QMainWindow):
             )
             loaded_items.append((source_path, item_result, print_path))
 
-        desired_width = paper.width() * 81.0 / paper_mm.width()
-        desired_height = paper.height() * 51.0 / paper_mm.height()
+        first_reader = QImageReader(str(loaded_items[0][2]))
+        first_size = first_reader.size()
+        if first_size.isEmpty():
+            first_image = QImage(str(loaded_items[0][2]))
+            first_size = first_image.size()
+        if first_size.isEmpty():
+            self._finish_print_attempt("image_size_unavailable")
+            QMessageBox.critical(self, "인쇄 오류", "사진 크기를 읽지 못했습니다.")
+            return
         fit_scale = min(
-            1.0,
-            printable.width() / desired_width,
-            printable.height() / desired_height,
+            paper.width() / first_size.width(),
+            paper.height() / first_size.height(),
         )
-        target_width = desired_width * fit_scale
-        target_height = desired_height * fit_scale
+        target_width = first_size.width() * fit_scale
+        target_height = first_size.height() * fit_scale
         target_x = QRectF(paper).center().x() - target_width / 2.0
         target_y = QRectF(paper).center().y() - target_height / 2.0
-        target_x = min(max(target_x, printable.left()), printable.right() - target_width)
-        target_y = min(max(target_y, printable.top()), printable.bottom() - target_height)
         target = QRectF(target_x, target_y, target_width, target_height)
         # QPrinter with fullPage=False uses pageRect's top-left as the painter
         # origin. Keep both coordinate interpretations in the diagnostic log.
         target_painter_origin = target.translated(-page.x(), -page.y())
         target_if_paper_coordinates_are_passed = target.translated(page.x(), page.y())
+        # QPrinter's painter starts at the printable area's origin when
+        # fullPage() is false.  Geometry above is in paper coordinates, so
+        # remove the page offset before drawing to that painter.
+        target_for_painter = target if printer.fullPage() else target_painter_origin
         paper_scale_x = paper_mm.width() / paper.width()
         paper_scale_y = paper_mm.height() / paper.height()
         photo_size_mm = [target_width * paper_scale_x, target_height * paper_scale_y]
@@ -1986,19 +1985,23 @@ class MainWindow(QMainWindow):
             mapped_target = None
             try:
                 transform = painter.deviceTransform()
-                mapped_target = transform.mapRect(target)
+                mapped_target = transform.mapRect(target_for_painter)
                 painter_clip = painter.clipBoundingRect()
-                logical_intersection = target.intersected(painter_clip)
+                logical_intersection = target_for_painter.intersected(painter_clip)
                 geometry_diagnostics = {
                     "target_rect_mapped_to_device": self._rect_diagnostics(mapped_target),
+                    "target_rect_in_painter_coordinates": self._rect_diagnostics(
+                        target_for_painter
+                    ),
+                    "target_rect_in_paper_coordinates": self._rect_diagnostics(target),
                     "target_intersection_with_painter_clip": self._rect_diagnostics(
                         logical_intersection
                     ),
                     "target_clipped_by_painter_px": {
-                        "left": max(0.0, logical_intersection.left() - target.left()),
-                        "top": max(0.0, logical_intersection.top() - target.top()),
-                        "right": max(0.0, target.right() - logical_intersection.right()),
-                        "bottom": max(0.0, target.bottom() - logical_intersection.bottom()),
+                        "left": max(0.0, logical_intersection.left() - target_for_painter.left()),
+                        "top": max(0.0, logical_intersection.top() - target_for_painter.top()),
+                        "right": max(0.0, target_for_painter.right() - logical_intersection.right()),
+                        "bottom": max(0.0, target_for_painter.bottom() - logical_intersection.bottom()),
                     },
                     "painter_has_clip": painter.hasClipping(),
                     "painter_clip_rect_logical": self._rect_diagnostics(painter_clip),
@@ -2019,7 +2022,7 @@ class MainWindow(QMainWindow):
                     f"{attempt_log.stem}_page_{index + 1:02d}_app-render.png"
                 )
                 preview_info = self._write_print_geometry_preview(
-                    preview_path, image, target, paper, page, printer.fullPage(),
+                    preview_path, image, target_for_painter, paper, page, printer.fullPage(),
                 )
             except Exception as exc:
                 # Diagnostics must never prevent or alter the requested print.
@@ -2033,7 +2036,10 @@ class MainWindow(QMainWindow):
                 }
             draw_context = {
                 "page_number": index + 1,
-                "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
+                "target_rect_passed_to_draw_image": self._rect_diagnostics(
+                    target_for_painter
+                ),
+                "target_rect_in_paper_coordinates": self._rect_diagnostics(target),
                 "page_rect_device_px": self._rect_diagnostics(page),
                 "paper_rect_device_px": self._rect_diagnostics(paper),
                 "app_side_render_preview": preview_info,
@@ -2042,7 +2048,7 @@ class MainWindow(QMainWindow):
                 **geometry_diagnostics,
             }
             self._record_print_event("draw_geometry_and_bitmap", **draw_context)
-            painter.drawImage(target, image)
+            painter.drawImage(target_for_painter, image)
             rendered_count += 1
             page_details = {
                 "page_number": index + 1,
@@ -2050,7 +2056,10 @@ class MainWindow(QMainWindow):
                 "image_path": str(print_path),
                 "image_size_px": [image.width(), image.height()],
                 "image_sha256": bitmap_diagnostics.get("sha256"),
-                "target_rect_passed_to_draw_image": self._rect_diagnostics(target),
+                "target_rect_passed_to_draw_image": self._rect_diagnostics(
+                    target_for_painter
+                ),
+                "target_rect_in_paper_coordinates": self._rect_diagnostics(target),
                 "target_rect_mapped_to_device": (
                     self._rect_diagnostics(mapped_target) if mapped_target is not None else None
                 ),
