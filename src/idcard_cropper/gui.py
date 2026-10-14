@@ -1604,7 +1604,7 @@ class MainWindow(QMainWindow):
         form.addRow("방향", QLabel("가로"))
         form.addRow(
             "인쇄 배치",
-            QLabel("절취 탭 안쪽 C 카드 영역을 크롭 이미지로 채움", dialog),
+            QLabel("크롭 이미지 8.1 × 5.1cm 실크기 인쇄", dialog),
         )
         self._record_print_event(
             "print_dialog_opened",
@@ -1612,7 +1612,7 @@ class MainWindow(QMainWindow):
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            layout="fill_c_card_cut_area_without_cropping_image",
+            layout="print_crop_at_81x51mm_centered_on_c_media",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1644,7 +1644,7 @@ class MainWindow(QMainWindow):
         virtual_pdf = requested_action["value"] == "pdf"
 
         selected_printer = printer_combo.currentText()
-        layout_name = "fill_c_card_cut_area_without_cropping_image"
+        layout_name = "print_crop_at_81x51mm_centered_on_c_media"
         if self._active_print_attempt:
             self._active_print_attempt["data"].update(
                 layout=layout_name,
@@ -1663,9 +1663,9 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # The C-size page is the cut area between SELPHY's perforated tabs.
-        # Fill that complete area; pageRect can be smaller because of driver
-        # margins and would leave unwanted white borders inside the cut area.
+        # Preserve the crop's intended physical size (8.1 x 5.1 cm) on the
+        # larger 86 x 54 mm C media. Expanding it to the entire media causes
+        # the SELPHY borderless path to enlarge and clip edge content.
         # The selected media/orientation are reapplied for every print job.
         printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
@@ -1799,7 +1799,17 @@ class MainWindow(QMainWindow):
             self._finish_print_attempt("image_size_unavailable")
             QMessageBox.critical(self, "인쇄 오류", "사진 크기를 읽지 못했습니다.")
             return
-        target = QRectF(paper)
+        paper_scale_x = paper_mm.width() / paper.width()
+        paper_scale_y = paper_mm.height() / paper.height()
+        photo_size_mm = [81.0, 51.0]
+        target_width_px = photo_size_mm[0] / paper_scale_x
+        target_height_px = photo_size_mm[1] / paper_scale_y
+        target = QRectF(
+            paper.x() + (paper.width() - target_width_px) / 2.0,
+            paper.y() + (paper.height() - target_height_px) / 2.0,
+            target_width_px,
+            target_height_px,
+        )
         # QPrinter with fullPage=False uses pageRect's top-left as the painter
         # origin. Keep both coordinate interpretations in the diagnostic log.
         target_painter_origin = target.translated(-page.x(), -page.y())
@@ -1808,9 +1818,6 @@ class MainWindow(QMainWindow):
         # fullPage() is false.  Geometry above is in paper coordinates, so
         # remove the page offset before drawing to that painter.
         target_for_painter = target if printer.fullPage() else target_painter_origin
-        paper_scale_x = paper_mm.width() / paper.width()
-        paper_scale_y = paper_mm.height() / paper.height()
-        photo_size_mm = [target.width() * paper_scale_x, target.height() * paper_scale_y]
         margins_mm = [
             (target.left() - paper.left()) * paper_scale_x,
             (target.top() - paper.top()) * paper_scale_y,
