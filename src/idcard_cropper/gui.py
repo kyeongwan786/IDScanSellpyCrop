@@ -1697,7 +1697,9 @@ class MainWindow(QMainWindow):
             "printer_make_and_model": printer_info.makeAndModel(),
             "printer_is_default": printer_info.isDefault(),
             "printer_state_before_job": printer.printerState().name,
-            "printer_mode": printer.printerMode().name,
+            # QPrinter exposes the selected mode at construction, but PySide6
+            # does not provide a printerMode() getter.
+            "printer_mode_requested": QPrinter.PrinterMode.HighResolution.name,
             "full_page": printer.fullPage(),
             "resolution_dpi": printer.resolution(),
             "logical_dpi": [printer.logicalDpiX(), printer.logicalDpiY()],
