@@ -1604,7 +1604,7 @@ class MainWindow(QMainWindow):
         form.addRow("방향", QLabel("가로"))
         form.addRow(
             "인쇄 배치",
-            QLabel("용지 안에 사진 전체 맞춤 · 잘림 없음", dialog),
+            QLabel("프린터 출력 가능 영역에 사진 전체 맞춤", dialog),
         )
         self._record_print_event(
             "print_dialog_opened",
@@ -1612,7 +1612,7 @@ class MainWindow(QMainWindow):
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            layout="fit_complete_image_inside_full_paper",
+            layout="fit_complete_image_inside_printable_area",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1644,7 +1644,7 @@ class MainWindow(QMainWindow):
         virtual_pdf = requested_action["value"] == "pdf"
 
         selected_printer = printer_combo.currentText()
-        layout_name = "fit_complete_image_inside_full_paper"
+        layout_name = "fit_complete_image_inside_printable_area"
         if self._active_print_attempt:
             self._active_print_attempt["data"].update(
                 layout=layout_name,
@@ -1663,10 +1663,11 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Use the selected sheet as the layout area. The image is fit inside it
-        # with its aspect ratio preserved, so no part of the crop is discarded.
+        # Draw within the printable area reported by the printer driver. Full
+        # page mode targets physical sheet edges that the device may not print,
+        # which can clip image content even though the source bitmap is intact.
         # The selected media/orientation are reapplied for every print job.
-        printer.setFullPage(True)
+        printer.setFullPage(False)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
@@ -1799,13 +1800,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "인쇄 오류", "사진 크기를 읽지 못했습니다.")
             return
         fit_scale = min(
-            paper.width() / first_size.width(),
-            paper.height() / first_size.height(),
+            printable.width() / first_size.width(),
+            printable.height() / first_size.height(),
         )
         target_width = first_size.width() * fit_scale
         target_height = first_size.height() * fit_scale
-        target_x = QRectF(paper).center().x() - target_width / 2.0
-        target_y = QRectF(paper).center().y() - target_height / 2.0
+        target_x = printable.center().x() - target_width / 2.0
+        target_y = printable.center().y() - target_height / 2.0
         target = QRectF(target_x, target_y, target_width, target_height)
         # QPrinter with fullPage=False uses pageRect's top-left as the painter
         # origin. Keep both coordinate interpretations in the diagnostic log.
