@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import platform
@@ -15,7 +16,7 @@ from uuid import uuid4
 import cv2
 from PySide6.QtCore import (Qt, QThread, Signal, QRect, QRectF, QUrl, QSize, QSizeF, QMarginsF, QSettings, QEvent,
                             QTimer,
-                            QPoint, QMimeData, qVersion)
+                            QPoint, QPointF, QMimeData, qVersion)
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QIcon, QImage, QImageReader,
                            QPalette,
                            QKeySequence, QPixmap, QShortcut,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
@@ -48,6 +50,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .calibration import render_calibration_card
 from .engine import CropResult, enhance_for_recognition, process_image
 
 
@@ -79,6 +82,107 @@ def _preferred_printer_name() -> str:
         return selphy
     default = QPrinterInfo.defaultPrinterName()
     return default if default in names else (names[0] if names else "")
+
+
+PRINT_ADJUST_DEFAULTS = {
+    # Millimetres the printer cuts off each edge of the C card area, as read
+    # from the calibration card (outermost fully visible number per side).
+    "cut_left_mm": 0.0,
+    "cut_right_mm": 0.0,
+    "cut_top_mm": 0.0,
+    "cut_bottom_mm": 0.0,
+}
+# Area painted past the card edge with the photo's edge colour, so a slight
+# feed variation never shows white paper.
+PRINT_BLEED_MM = 1.5
+
+
+def _adjust_key(printer_name: str, key: str) -> str:
+    safe = "".join(ch if ch.isalnum() else "_" for ch in printer_name) or "default"
+    return f"printing/calibration/{safe}/{key}"
+
+
+def _load_print_adjustments(printer_name: str) -> dict[str, float]:
+    settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+    values = {}
+    for key, default in PRINT_ADJUST_DEFAULTS.items():
+        try:
+            values[key] = float(settings.value(_adjust_key(printer_name, key), default))
+        except (TypeError, ValueError):
+            values[key] = default
+    return values
+
+
+def _save_print_adjustments(printer_name: str, values: dict[str, float]) -> None:
+    settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+    for key, value in values.items():
+        settings.setValue(_adjust_key(printer_name, key), float(value))
+    settings.sync()
+
+
+def _print_layout_rects(
+    paper: QRectF, paper_w_mm: float, paper_h_mm: float, adjust: dict[str, float],
+) -> tuple[QRectF, QRectF]:
+    """Return (canvas, content) rects in the same units as ``paper``.
+
+    ``content`` is the part of the card that actually comes out of the
+    printer (paper minus the measured cut on each side); the photo is fitted
+    there.  ``canvas`` is the paper plus a bleed; everything outside the
+    photo is filled with its edge pixels instead of white.
+    """
+    px_x = paper.width() / paper_w_mm
+    px_y = paper.height() / paper_h_mm
+    bleed_x = PRINT_BLEED_MM * px_x
+    bleed_y = PRINT_BLEED_MM * px_y
+    canvas = QRectF(paper).adjusted(-bleed_x, -bleed_y, bleed_x, bleed_y)
+    content = QRectF(paper).adjusted(
+        adjust["cut_left_mm"] * px_x,
+        adjust["cut_top_mm"] * px_y,
+        -adjust["cut_right_mm"] * px_x,
+        -adjust["cut_bottom_mm"] * px_y,
+    )
+    return canvas, content
+
+
+def _compose_print_canvas(image: QImage, canvas: QRectF, content: QRectF) -> QImage:
+    """Draw ``image`` into ``content`` and fill the rest of ``canvas`` with edge pixels."""
+    cw = max(1, round(canvas.width()))
+    ch = max(1, round(canvas.height()))
+    x0 = round(content.left() - canvas.left())
+    y0 = round(content.top() - canvas.top())
+    w = max(1, round(content.width()))
+    h = max(1, round(content.height()))
+    x1, y1 = x0 + w, y0 + h
+    src = image.convertToFormat(QImage.Format.Format_RGB32).scaled(
+        w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    out = QImage(cw, ch, QImage.Format.Format_RGB32)
+    out.fill(QColor(src.pixel(0, 0)))
+    painter = QPainter(out)
+    try:
+        def fill(x, y, rw, rh, color_xy):
+            if rw > 0 and rh > 0:
+                painter.fillRect(QRect(x, y, rw, rh), QColor(src.pixel(*color_xy)))
+
+        def stretch(x, y, rw, rh, sx, sy, sw, sh):
+            if rw > 0 and rh > 0:
+                painter.drawImage(QRectF(x, y, rw, rh), src, QRectF(sx, sy, sw, sh))
+
+        # Corners
+        fill(0, 0, x0, y0, (0, 0))
+        fill(x1, 0, cw - x1, y0, (w - 1, 0))
+        fill(0, y1, x0, ch - y1, (0, h - 1))
+        fill(x1, y1, cw - x1, ch - y1, (w - 1, h - 1))
+        # Edges: stretch the outermost row/column of the photo outward.
+        stretch(0, y0, x0, h, 0, 0, 1, h)
+        stretch(x1, y0, cw - x1, h, w - 1, 0, 1, h)
+        stretch(x0, 0, w, y0, 0, 0, w, 1)
+        stretch(x0, y1, w, ch - y1, 0, h - 1, w, 1)
+        painter.drawImage(x0, y0, src)
+    finally:
+        painter.end()
+    return out
 
 
 def _c_size_for_printer(printer: QPrinter) -> QPageSize:
@@ -1476,6 +1580,7 @@ class MainWindow(QMainWindow):
         photo_size_mm: list[float],
         margins_mm: list[float],
         dpi: int,
+        adjust: dict[str, float] | None = None,
     ) -> None:
         """Render the exact printer target onto virtual 86 x 54 mm PDF pages."""
         writer = QPdfWriter(str(path))
@@ -1502,6 +1607,10 @@ class MainWindow(QMainWindow):
             photo_size_mm[0] * px_per_mm_x,
             photo_size_mm[1] * px_per_mm_y,
         )
+        canvas_rect, content_rect = _print_layout_rects(
+            QRectF(page), 86.0, 54.0, adjust or PRINT_ADJUST_DEFAULTS,
+        )
+        target = canvas_rect
 
         painter = QPainter()
         if not painter.begin(writer):
@@ -1512,6 +1621,7 @@ class MainWindow(QMainWindow):
                 image = QImage(str(image_path))
                 if image.isNull():
                     raise OSError(f"PDF 검사 이미지를 열 수 없습니다: {image_path}")
+                image = _compose_print_canvas(image, canvas_rect, content_rect)
                 if index and not writer.newPage():
                     raise OSError(f"PDF 검사 {index + 1}페이지를 만들지 못했습니다.")
                 painter.drawImage(target, image)
@@ -1604,15 +1714,50 @@ class MainWindow(QMainWindow):
         form.addRow("방향", QLabel("가로"))
         form.addRow(
             "인쇄 배치",
-            QLabel("크롭 이미지 8.1 × 5.1cm 실크기 인쇄", dialog),
+            QLabel("절취 탭 안쪽 C 카드 영역을 크롭 이미지로 채움", dialog),
         )
+        adjust_spins: dict[str, QDoubleSpinBox] = {}
+        adjust_specs = [
+            ("cut_left_mm", "왼쪽 잘림"),
+            ("cut_right_mm", "오른쪽 잘림"),
+            ("cut_top_mm", "위쪽 잘림"),
+            ("cut_bottom_mm", "아래쪽 잘림"),
+        ]
+        form.addRow(QLabel(
+            "보정 카드를 한 장 인쇄한 뒤, 각 변에서 끝까지 온전히 보이는\n"
+            "가장 바깥 숫자를 입력하세요. 프린터마다 저장됩니다.", dialog,
+        ))
+        for key, label_text in adjust_specs:
+            spin = QDoubleSpinBox(dialog)
+            spin.setRange(0.0, 5.0)
+            spin.setSingleStep(0.25)
+            spin.setDecimals(2)
+            spin.setSuffix(" mm")
+            adjust_spins[key] = spin
+            form.addRow(label_text, spin)
+
+        def load_adjust_for(name: str) -> None:
+            for k, v in _load_print_adjustments(name).items():
+                adjust_spins[k].setValue(v)
+
+        load_adjust_for(printer_combo.currentText())
+        printer_combo.currentTextChanged.connect(load_adjust_for)
+        calibration_button = QPushButton("보정 카드 인쇄", dialog)
+        calibration_button.setToolTip(
+            "0.25mm 간격 눈금 카드를 보정 없이 인쇄합니다. "
+            "현재 드라이버 설정(C 카드, 테두리 없음)과 같은 상태로 인쇄하세요."
+        )
+        calibration_button.clicked.connect(
+            lambda: self.print_calibration_card(printer_combo.currentText())
+        )
+        form.addRow(calibration_button)
         self._record_print_event(
             "print_dialog_opened",
             candidate_printer=preferred_name,
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            layout="print_crop_at_81x51mm_centered_on_c_media",
+            layout="fill_c_card_cut_area_without_cropping_image",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1642,9 +1787,16 @@ class MainWindow(QMainWindow):
             self._finish_print_attempt("cancelled_in_print_dialog")
             return
         virtual_pdf = requested_action["value"] == "pdf"
+        print_adjust = {key: spin.value() for key, spin in adjust_spins.items()}
+        _save_print_adjustments(printer_combo.currentText(), print_adjust)
+        self._record_print_event(
+            "print_adjustments", bleed_mm=PRINT_BLEED_MM, **print_adjust,
+        )
+        if self._active_print_attempt:
+            self._active_print_attempt["data"]["print_adjustments"] = print_adjust
 
         selected_printer = printer_combo.currentText()
-        layout_name = "print_crop_at_81x51mm_centered_on_c_media"
+        layout_name = "fill_c_card_cut_area_without_cropping_image"
         if self._active_print_attempt:
             self._active_print_attempt["data"].update(
                 layout=layout_name,
@@ -1663,9 +1815,9 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Preserve the crop's intended physical size (8.1 x 5.1 cm) on the
-        # larger 86 x 54 mm C media. Expanding it to the entire media causes
-        # the SELPHY borderless path to enlarge and clip edge content.
+        # The C-size page is the cut area between SELPHY's perforated tabs.
+        # Fill that complete area; pageRect can be smaller because of driver
+        # margins and would leave unwanted white borders inside the cut area.
         # The selected media/orientation are reapplied for every print job.
         printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
@@ -1799,17 +1951,14 @@ class MainWindow(QMainWindow):
             self._finish_print_attempt("image_size_unavailable")
             QMessageBox.critical(self, "인쇄 오류", "사진 크기를 읽지 못했습니다.")
             return
-        paper_scale_x = paper_mm.width() / paper.width()
-        paper_scale_y = paper_mm.height() / paper.height()
-        photo_size_mm = [81.0, 51.0]
-        target_width_px = photo_size_mm[0] / paper_scale_x
-        target_height_px = photo_size_mm[1] / paper_scale_y
-        target = QRectF(
-            paper.x() + (paper.width() - target_width_px) / 2.0,
-            paper.y() + (paper.height() - target_height_px) / 2.0,
-            target_width_px,
-            target_height_px,
+        # The photo lands in ``content`` (C card area adjusted by the user's
+        # position/size correction).  ``canvas`` extends past the card by the
+        # bleed and is filled with the photo's edge pixels, so driver overscan
+        # or a slight feed offset never exposes white paper.
+        canvas_rect, content_rect = _print_layout_rects(
+            QRectF(paper), paper_mm.width(), paper_mm.height(), print_adjust,
         )
+        target = canvas_rect
         # QPrinter with fullPage=False uses pageRect's top-left as the painter
         # origin. Keep both coordinate interpretations in the diagnostic log.
         target_painter_origin = target.translated(-page.x(), -page.y())
@@ -1818,6 +1967,9 @@ class MainWindow(QMainWindow):
         # fullPage() is false.  Geometry above is in paper coordinates, so
         # remove the page offset before drawing to that painter.
         target_for_painter = target if printer.fullPage() else target_painter_origin
+        paper_scale_x = paper_mm.width() / paper.width()
+        paper_scale_y = paper_mm.height() / paper.height()
+        photo_size_mm = [target.width() * paper_scale_x, target.height() * paper_scale_y]
         margins_mm = [
             (target.left() - paper.left()) * paper_scale_x,
             (target.top() - paper.top()) * paper_scale_y,
@@ -1876,7 +2028,7 @@ class MainWindow(QMainWindow):
             try:
                 self._export_virtual_print_pdf(
                     pdf_path, loaded_items, photo_size_mm, margins_mm,
-                    printer.resolution(),
+                    printer.resolution(), print_adjust,
                 )
             except Exception as exc:
                 self._record_print_event(
@@ -1922,8 +2074,8 @@ class MainWindow(QMainWindow):
                 self, "가상 PDF 저장 완료",
                 "종이를 사용하지 않고 가상 인쇄 PDF를 저장했습니다.\n\n"
                 f"{pdf_path}\n\n"
-                "PDF 안에 오른쪽 흰 선이 있으면 앱의 이미지 배치 쪽을, "
-                "없으면 Canon 드라이버로 보내는 과정의 차이를 더 확인하면 됩니다.",
+                "PDF는 카드 영역(86 × 54mm)만 보여 주므로 위치·크기 보정 결과를 "
+                "종이 없이 확인할 수 있습니다.",
             )
             return
 
@@ -1976,6 +2128,8 @@ class MainWindow(QMainWindow):
         page_failure = None
         for index, (source_path, item_result, print_path) in enumerate(loaded_items):
             image = QImage(str(print_path))
+            if not image.isNull():
+                image = _compose_print_canvas(image, canvas_rect, content_rect)
             if image.isNull():
                 page_error = True
                 page_failure = {"page_number": index + 1, "reason": "image_load_failed",
@@ -2145,6 +2299,43 @@ class MainWindow(QMainWindow):
                 f"{len(loaded_items)}개 사진을 인쇄 대기열로 보냈습니다. "
                 f"인쇄 로그: {finished_log_path or job_log_path}"
             )
+
+    def print_calibration_card(self, printer_name: str) -> None:
+        """Print the 0.25 mm ruler card with no compensation applied."""
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPrinterName(printer_name)
+        _set_c_landscape_default(printer)
+        printer.setDocName("SELPHY 보정 카드")
+        printer.setFullPage(True)
+        paper = printer.paperRect(QPrinter.Unit.DevicePixel)
+        paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
+        if not (abs(paper_mm.width() - 86.0) <= 0.5 and abs(paper_mm.height() - 54.0) <= 0.5):
+            QMessageBox.warning(
+                self, "용지 방향 확인",
+                "프린터가 86 × 54mm C 용지 가로 방향을 적용하지 않았습니다.\n"
+                f"프린터가 보고한 크기: {paper_mm.width():.1f} × {paper_mm.height():.1f}mm",
+            )
+            return
+        card = render_calibration_card(max(1, paper.width()), max(1, paper.height()))
+        buffer = io.BytesIO()
+        card.save(buffer, format="PNG")
+        image = QImage.fromData(buffer.getvalue(), "PNG")
+        painter = QPainter()
+        if not painter.begin(printer):
+            QMessageBox.critical(self, "인쇄 오류", "프린터 작업을 시작하지 못했습니다.")
+            return
+        try:
+            painter.drawImage(QRectF(paper), image)
+        finally:
+            painter.end()
+        QMessageBox.information(
+            self, "보정 카드 전송",
+            "보정 카드를 인쇄 대기열로 보냈습니다.\n\n"
+            "인쇄된 카드의 각 변(LEFT / RIGHT / TOP / BOTTOM)에서\n"
+            "선과 숫자가 온전히 보이는 가장 바깥 숫자를 읽어\n"
+            "왼쪽·오른쪽·위쪽·아래쪽 잘림 칸에 입력하세요.\n"
+            "모든 선이 보이고 가장자리에 여유가 있으면 0을 입력합니다.",
+        )
 
     def handle_print_clicked(
         self, paths: list[Path] | None = None, scope_label: str = "선택한",
