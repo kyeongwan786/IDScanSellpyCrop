@@ -1604,7 +1604,7 @@ class MainWindow(QMainWindow):
         form.addRow("방향", QLabel("가로"))
         form.addRow(
             "인쇄 배치",
-            QLabel("프린터 출력 가능 영역에 사진 전체 맞춤", dialog),
+            QLabel("절취 탭 안쪽 C 카드 영역을 크롭 이미지로 채움", dialog),
         )
         self._record_print_event(
             "print_dialog_opened",
@@ -1612,7 +1612,7 @@ class MainWindow(QMainWindow):
             expected_pages=len(print_items),
             media="C Size",
             orientation="Landscape",
-            layout="fit_complete_image_inside_printable_area",
+            layout="fill_c_card_cut_area_without_cropping_image",
         )
         preferences_button = QPushButton("프린터 드라이버 설정 저장…", dialog)
         preferences_button.setVisible(sys.platform == "win32")
@@ -1644,7 +1644,7 @@ class MainWindow(QMainWindow):
         virtual_pdf = requested_action["value"] == "pdf"
 
         selected_printer = printer_combo.currentText()
-        layout_name = "fit_complete_image_inside_printable_area"
+        layout_name = "fill_c_card_cut_area_without_cropping_image"
         if self._active_print_attempt:
             self._active_print_attempt["data"].update(
                 layout=layout_name,
@@ -1663,11 +1663,11 @@ class MainWindow(QMainWindow):
         _set_c_landscape_default(printer)
         printer.setDocName(f"신분증 사진 {len(print_items)}장")
 
-        # Draw within the printable area reported by the printer driver. Full
-        # page mode targets physical sheet edges that the device may not print,
-        # which can clip image content even though the source bitmap is intact.
+        # The C-size page is the cut area between SELPHY's perforated tabs.
+        # Fill that complete area; pageRect can be smaller because of driver
+        # margins and would leave unwanted white borders inside the cut area.
         # The selected media/orientation are reapplied for every print job.
-        printer.setFullPage(False)
+        printer.setFullPage(True)
         paper = printer.paperRect(QPrinter.Unit.DevicePixel)
         page = printer.pageRect(QPrinter.Unit.DevicePixel)
         paper_mm = printer.paperRect(QPrinter.Unit.Millimeter)
@@ -1799,15 +1799,7 @@ class MainWindow(QMainWindow):
             self._finish_print_attempt("image_size_unavailable")
             QMessageBox.critical(self, "인쇄 오류", "사진 크기를 읽지 못했습니다.")
             return
-        fit_scale = min(
-            printable.width() / first_size.width(),
-            printable.height() / first_size.height(),
-        )
-        target_width = first_size.width() * fit_scale
-        target_height = first_size.height() * fit_scale
-        target_x = printable.center().x() - target_width / 2.0
-        target_y = printable.center().y() - target_height / 2.0
-        target = QRectF(target_x, target_y, target_width, target_height)
+        target = QRectF(paper)
         # QPrinter with fullPage=False uses pageRect's top-left as the painter
         # origin. Keep both coordinate interpretations in the diagnostic log.
         target_painter_origin = target.translated(-page.x(), -page.y())
@@ -1827,7 +1819,10 @@ class MainWindow(QMainWindow):
             self._active_print_attempt["data"].update(
                 photo_size_mm=photo_size_mm,
                 margins_mm=margins_mm,
-                fit_scale=fit_scale,
+                image_scale_xy=[
+                    target.width() / first_size.width(),
+                    target.height() / first_size.height(),
+                ],
             )
         self._record_print_event(
             "print_target_fitted",
@@ -1842,7 +1837,10 @@ class MainWindow(QMainWindow):
             coordinate_origin_offset_device_px=[page.x(), page.y()],
             full_page_coordinate_origin=printer.fullPage(),
             actual_image_size_mm=photo_size_mm,
-            fit_scale=fit_scale,
+            image_scale_xy=[
+                target.width() / first_size.width(),
+                target.height() / first_size.height(),
+            ],
             printable_rect_device_px=[
                 printable.x(), printable.y(), printable.width(), printable.height(),
             ],
