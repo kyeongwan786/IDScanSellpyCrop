@@ -1810,7 +1810,7 @@ class MainWindow(QMainWindow):
         target_for_painter = target if printer.fullPage() else target_painter_origin
         paper_scale_x = paper_mm.width() / paper.width()
         paper_scale_y = paper_mm.height() / paper.height()
-        photo_size_mm = [target_width * paper_scale_x, target_height * paper_scale_y]
+        photo_size_mm = [target.width() * paper_scale_x, target.height() * paper_scale_y]
         margins_mm = [
             (target.left() - paper.left()) * paper_scale_x,
             (target.top() - paper.top()) * paper_scale_y,
